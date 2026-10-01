@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "omaimediateka",
+  "name": "Omaimediateka",
+  "version": "0.1.0",
+  "author": "Aleksey Abaydulin",
+  "license": "MIT",
+  "description": "Медиатека iPhone по USB: сетка фото и видео из DCIM и полноэкранный просмотр. Только просмотр.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "iPhone",
+    "description": "Фото и видео iPhone по USB (только просмотр)",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
