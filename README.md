@@ -21,7 +21,9 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
   cached on disk and invalidated by size/mtime.
 - **Fullscreen viewer** — photos fit the screen; videos play inline through
   QtMultimedia. `←/→` navigates, metadata (name, date, size, duration) is shown.
-- **Live filter** by file name or folder, and newest-/oldest-first sorting.
+- **Live filter** by file name or folder, plus **content search** over Apple's
+  on-device index (localized scene/OCR tokens and English captions) with a
+  per-cell source badge, and newest-/oldest-first sorting.
 - **Export** (read-only on the phone): save the original to `~/Pictures/iPhone`
   (`Ctrl+S`) or pick a folder (`Ctrl+Shift+S`); existing names get a ` (1)`, ` (2)`
   suffix instead of being overwritten. `Ctrl+C` puts a photo in the clipboard as
@@ -46,6 +48,8 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
 - **`qt6-multimedia-ffmpeg`** (optional) — in-widget video playback.
 - **`wl-clipboard`** (`wl-copy`) — copying to the clipboard (`Ctrl+C`).
 - **`zenity`** or **`kdialog`** (optional) — the “Save as” folder picker.
+- **`python3`** — builds and queries the compact content-search index. Without it
+  the name/folder filter and everything else still work; only content search is off.
 
 On Arch:
 
@@ -113,6 +117,8 @@ Uninstall with `./install.sh --uninstall`.
 | Move in the grid | `← → ↑ ↓` or `hjkl` |
 | Open fullscreen | `Enter`, `Space`, or click |
 | Filter | start typing; `Esc` in the field clears it |
+| Search by content | type a word after “Обновить поиск” has built the index; the badge shows the source |
+| Rebuild the search index | the “Обновить поиск” button in the header |
 | Sort | the “newest / oldest first” button |
 | Previous / next in viewer | `← →` or the side buttons |
 | Video play / pause | `p`, `Space`, or the button |
@@ -138,9 +144,21 @@ Uninstall with `./install.sh --uninstall`.
   - `names <dir>` / `copy <src> <dst>` — export: list existing names, then copy the
     original (refuses to overwrite; the UI adds the ` (1)`, ` (2)` suffix);
   - `clip-image <src>` / `clip-text <text>` — clipboard through `wl-copy`;
-  - `pick-dir [start]` — folder picker (`zenity`, else `kdialog`).
+  - `pick-dir [start]` — folder picker (`zenity`, else `kdialog`);
+  - `index [mount]` — copies the phone's Apple search databases (read-only) and
+    builds/refreshes the compact search cache (incremental, with progress);
+  - `search <query>` — `path<TAB>source<TAB>matched` rows from that cache.
 - **Cache** — `~/.cache/omaimediateka/thumbs/` and `.../previews/`. Keys include the
   file size and mtime, so changed files are re-rendered and unchanged ones are reused.
+- **Content search** — the helper copies `Photos.sqlite` and `MediaAnalysis.sqlite`
+  into `~/.cache/omaimediateka/apple-index/` and turns Apple's Leo lexeme index and
+  Vision captions into a compact `search.sqlite` (`asset`, `token`, `caption`). The
+  BLOB parsing runs in `bin/oma-mediateka-index.py`. The index is refreshed
+  incrementally when the phone is reconnected (or on demand), so browsing never
+  waits for it. Russian tokens are stemmed and matched by prefix, English captions
+  by word prefix, and name/folder matches are merged in. Search results collapse a
+  Live Photo's HEIC+MOV into the photo and rank elements by how many content
+  sources matched.
 - **Sorting** — by Apple’s file numbering (folder + number), which is chronological
   even when gvfs `mtime` is unreliable, with mtime as a tie-breaker.
 
@@ -154,7 +172,14 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 - The **interface is currently in Russian**; the code and this README are in English.
   Localization PRs are welcome.
 - Sorting follows Apple’s file numbering, **not EXIF capture date**.
-- **Live Photos** show up as two separate items (a HEIC and a MOV).
+- **Live Photos** show up as two separate items in the grid (a HEIC and a MOV);
+  in content-search results the pair is collapsed to the photo.
+- **Content search** reuses an undocumented Apple index: ~99.5 % of assets are
+  covered, assets stored only in iCloud are skipped (no local file), and an iOS
+  update may change the schema — in which case search degrades gracefully to
+  name/folder filtering.
+- The content index is built per device in `~/.cache/omaimediateka/` and refreshed
+  when the phone reconnects; the first build copies ~330 MB over USB (~15 s).
 - One iPhone at a time; the first detected device wins.
 - `ifuse` is not used. The backend is isolated in `bin/oma-mediateka`, so adding it
   later would not touch the QML.
@@ -162,9 +187,10 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 ## Development
 
 ```bash
-node test/MediaModel.test.js   # pure model: listing, sorting, filtering, cache keys
-bash -n bin/oma-mediateka      # helper syntax
-./bin/oma-mediateka status     # with no phone: state=no-device
+node test/MediaModel.test.js        # pure model: listing, sorting, filtering, search merge
+bash -n bin/oma-mediateka           # helper syntax
+python3 -m py_compile bin/oma-mediateka-index.py   # indexer syntax
+./bin/oma-mediateka status          # with no phone: state=no-device
 ```
 
 Repository layout:
@@ -174,10 +200,11 @@ manifest.json      # id, kinds: bar-widget, entryPoints.barWidget
 Panel.qml          # bar pill + popup: grid, filter, fullscreen viewer
 VideoView.qml      # QtMultimedia player, imported in isolation
 MediaModel.js      # pure, node-testable model
-bin/oma-mediateka  # status | list | thumb | meta
+bin/oma-mediateka  # status | list | thumb | meta | … | index | search
+bin/oma-mediateka-index.py  # content-search cache build + query (python3)
 install.sh         # install / uninstall
 test/              # node tests for the model
-docs/              # design spec and screenshots
+docs/              # design spec, research notes and screenshots
 ```
 
 ## License

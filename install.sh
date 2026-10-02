@@ -33,7 +33,8 @@ for f in manifest.json Panel.qml VideoView.qml MediaModel.js README.md LICENSE; 
 done
 mkdir -p "$dest/bin"
 cp -f "$here/bin/oma-mediateka" "$dest/bin/"
-chmod +x "$dest/bin/oma-mediateka"
+cp -f "$here/bin/oma-mediateka-index.py" "$dest/bin/"
+chmod +x "$dest/bin/oma-mediateka" "$dest/bin/oma-mediateka-index.py"
 
 echo "Установлено: $dest"
 echo

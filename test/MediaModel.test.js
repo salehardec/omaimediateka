@@ -183,4 +183,133 @@ test("fileWord: русское склонение", () => {
   assert.strictEqual(M.fileWord(0), "файлов")
 })
 
+// --- поиск по содержимому --------------------------------------------------
+
+const SEARCH_ITEMS = M.parseListing([
+  "1600000000\t100\t/mnt/DCIM/100APPLE/IMG_0100.HEIC",
+  "1600000100\t200\t/mnt/DCIM/100APPLE/IMG_0100.MOV",
+  "1600000200\t300\t/mnt/DCIM/100APPLE/IMG_0200.JPG",
+  "1600000300\t400\t/mnt/DCIM/100APPLE/IMG_0300.HEIC"
+].join("\n"))
+const SEARCH_ROWS = [
+  "/mnt/DCIM/100APPLE/IMG_0100.HEIC\tscene\tРыбалка",
+  "/mnt/DCIM/100APPLE/IMG_0100.HEIC\tocr\tрыба",
+  "/mnt/DCIM/100APPLE/IMG_0100.MOV\tcaption\ta child holding a fish",
+  "/mnt/DCIM/100APPLE/IMG_0200.JPG\tscene\tМоре",
+  "/mnt/DCIM/100APPLE/IMG_0300.HEIC\tscene\tПляж",
+  "/mnt/DCIM/100APPLE/IMG_0300.HEIC\tplace\tМоре"
+].join("\n")
+
+function pathOf(name) { return "/mnt/DCIM/100APPLE/" + name }
+
+function findRow(items, name) {
+  return items.find((i) => i.name === name)
+}
+
+test("parseQuery: регистр, ё->е, пустой/короткий запрос", () => {
+  const q = M.parseQuery("  Рыбалка  Зимняя ")
+  assert.deepStrictEqual(q.tokens, ["рыбалка", "зимняя"])
+  assert.strictEqual(q.raw, "рыбалка  зимняя")
+  assert.strictEqual(q.valid, true)
+  const q2 = M.parseQuery("Ёж")
+  assert.deepStrictEqual(q2.tokens, ["еж"])
+  assert.strictEqual(q2.valid, true)
+  assert.strictEqual(M.parseQuery("").valid, false)
+  assert.strictEqual(M.parseQuery(" ").valid, false)
+  assert.strictEqual(M.parseQuery("я").valid, false)
+  assert.strictEqual(M.parseQuery("a").valid, false)
+})
+
+test("stemRu: обрезка окончаний, короткие стемы не трогает", () => {
+  assert.strictEqual(M.stemRu("Рыбалки"), "рыбалк")
+  assert.strictEqual(M.stemRu("Зимняя"), "зимн")
+  assert.strictEqual(M.stemRu("зимней"), "зимн")
+  assert.strictEqual(M.stemRu("документы"), "документ")
+  assert.strictEqual(M.stemRu("Море"), "море") // 3 буквы после отсечения -> не режем
+  assert.strictEqual(M.stemRu("рыб"), "рыб")
+  assert.strictEqual(M.stemRu("fish"), "fish") // латиница без стемминга
+})
+
+test("nameMatches: все токены в имени или папке", () => {
+  const it = findRow(SEARCH_ITEMS, "IMG_0100.HEIC")
+  assert.strictEqual(M.nameMatches(it, M.parseQuery("img_0100")), true)
+  assert.strictEqual(M.nameMatches(it, M.parseQuery("100apple")), true)
+  assert.strictEqual(M.nameMatches(it, M.parseQuery("0100 100apple")), true)
+  assert.strictEqual(M.nameMatches(it, M.parseQuery("0100 999")), false)
+})
+
+test("parseSearchRows / groupSearchRows: пути и источники", () => {
+  const rows = M.parseSearchRows(SEARCH_ROWS)
+  assert.strictEqual(rows.length, 6)
+  assert.deepStrictEqual(rows[0], { path: pathOf("IMG_0100.HEIC"), source: "scene", matched: "Рыбалка" })
+  const g = M.groupSearchRows(rows)
+  assert.deepStrictEqual(g[pathOf("IMG_0100.HEIC")].sources, ["scene", "ocr"])
+  assert.deepStrictEqual(g[pathOf("IMG_0100.HEIC")].matched.scene, ["Рыбалка"])
+  assert.strictEqual(g[pathOf("IMG_0200.JPG")].sources.length, 1)
+})
+
+test("mergeSearch: пустой запрос возвращает список как есть", () => {
+  assert.strictEqual(M.mergeSearch(SEARCH_ITEMS, [], "").length, SEARCH_ITEMS.length)
+})
+
+test("mergeSearch: имя и содержимое объединяются, есть бейдж источника", () => {
+  const rows = M.parseSearchRows([
+    pathOf("IMG_0100.HEIC") + "\tscene\tРыбалка",
+    pathOf("IMG_0100.HEIC") + "\tocr\tрыба"
+  ].join("\n"))
+  const res = M.mergeSearch(SEARCH_ITEMS, rows, "рыбалка")
+  assert.strictEqual(res.length, 1)
+  assert.strictEqual(res[0].name, "IMG_0100.HEIC")
+  assert.deepStrictEqual(res[0].sources, ["scene", "ocr"])
+  assert.strictEqual(M.badgeLabel(res[0]), "сцена · текст")
+  // совпадение только по имени — без бейджа
+  const byName = M.mergeSearch(SEARCH_ITEMS, [], "IMG_0300")
+  assert.strictEqual(byName.length, 1)
+  assert.deepStrictEqual(byName[0].sources, ["name"])
+  assert.strictEqual(M.badgeLabel(byName[0]), "")
+})
+
+test("mergeSearch: ранжирование по числу содержательных источников", () => {
+  const rows = M.parseSearchRows([
+    pathOf("IMG_0200.JPG") + "\tscene\tМоре",
+    pathOf("IMG_0300.HEIC") + "\tscene\tПляж",
+    pathOf("IMG_0300.HEIC") + "\tplace\tМоре"
+  ].join("\n"))
+  const res = M.mergeSearch(SEARCH_ITEMS, rows, "море")
+  assert.deepStrictEqual(res.map((i) => i.name), ["IMG_0300.HEIC", "IMG_0200.JPG"])
+  assert.ok(M.searchScore(res[0]) > M.searchScore(res[1]))
+})
+
+test("mergeSearch: Live Photo HEIC+MOV схлопывается в фото", () => {
+  const rows = M.parseSearchRows([
+    pathOf("IMG_0100.HEIC") + "\tocr\tрыба",
+    pathOf("IMG_0100.MOV") + "\tcaption\ta child holding a fish"
+  ].join("\n"))
+  const res = M.mergeSearch(SEARCH_ITEMS, rows, "fish")
+  assert.strictEqual(res.length, 1)
+  assert.strictEqual(res[0].name, "IMG_0100.HEIC")
+  assert.strictEqual(res[0].kind, "photo")
+  assert.deepStrictEqual(res[0].sources, ["ocr", "caption"])
+  assert.strictEqual(M.badgeLabel(res[0]), "текст · caption")
+})
+
+test("dedupeLivePairs: одинаковый тип не схлопывается, источники переносятся", () => {
+  const a = { name: "IMG_1.HEIC", kind: "photo", sources: ["scene"], matched: { scene: ["x"] } }
+  const b = { name: "IMG_1.MOV", kind: "video", sources: ["caption"], matched: { caption: ["y"] } }
+  const c = { name: "IMG_2.HEIC", kind: "photo", sources: ["name"], matched: {} }
+  const d = { name: "IMG_2.HEIC", kind: "photo", sources: ["ocr"], matched: { ocr: ["z"] } }
+  const res = M.dedupeLivePairs([a, b, c, d])
+  assert.strictEqual(res.length, 3)
+  assert.deepStrictEqual(res[0].sources, ["scene", "caption"])
+  assert.strictEqual(res[0].kind, "photo")
+})
+
+test("contentSources / sourceLabel / badgeLabel: до двух меток и +N", () => {
+  const it = { sources: ["name", "people", "place", "scene", "caption"] }
+  assert.deepStrictEqual(M.contentSources(it), ["scene", "place", "people", "caption"])
+  assert.strictEqual(M.sourceLabel("ocr"), "текст")
+  assert.strictEqual(M.badgeLabel(it), "сцена · место +2")
+  assert.strictEqual(M.badgeLabel({ sources: ["name"] }), "")
+})
+
 console.log("\n" + passed + " passed")
