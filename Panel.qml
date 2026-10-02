@@ -941,7 +941,7 @@ Panel {
                 text: root.selectionCount > 0
                   ? ("Выбрано: " + root.selectionCount + " · Space снять · Ctrl+A всё")
                   : "Space выбрать · Ctrl+A всё · Ctrl+S сохранить · Ctrl+C буфер"
-                color: root.dim
+                color: root.selectionCount > 0 ? root.fg : root.dim
                 font.family: root.fam
                 font.pixelSize: Style.font.caption
               }
@@ -1024,8 +1024,20 @@ Panel {
           font.pixelSize: Style.font.caption
         }
 
-        // верхняя панель
+        // верхняя панель: подложка-скрим, чтобы текст и кнопки читались на любом кадре
+        Rectangle {
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.margins: Style.space(2)
+          height: viewerHeaderRow.implicitHeight + Style.space(8)
+          radius: Style.cornerRadius
+          color: Util.alpha(Color.background, 0.88)
+          border.width: Style.space(1)
+          border.color: Util.alpha(root.fg, 0.15)
+        }
         RowLayout {
+          id: viewerHeaderRow
           anchors.top: parent.top
           anchors.left: parent.left
           anchors.right: parent.right
@@ -1054,7 +1066,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             text: String(root.viewerIndex + 1) + " / " + String(root.shown.length)
-            color: root.dim
+            color: root.fg
             font.family: root.fam
             font.pixelSize: Style.font.caption
           }
@@ -1088,18 +1100,29 @@ Panel {
           }
         }
 
-        // индикатор занятости / уведомление экспорта
-        Text {
+        // индикатор занятости / уведомление экспорта (на подложке)
+        Rectangle {
           anchors.horizontalCenter: parent.horizontalCenter
           anchors.bottom: parent.bottom
-          anchors.bottomMargin: Style.space(8)
-          textFormat: Text.PlainText
+          anchors.bottomMargin: Style.space(6)
+          width: viewerNotice.implicitWidth + Style.space(16)
+          height: viewerNotice.implicitHeight + Style.space(8)
+          radius: Style.cornerRadius
+          color: Util.alpha(Color.background, 0.88)
+          border.width: Style.space(1)
+          border.color: Util.alpha(root.fg, 0.15)
           visible: root.busy || root.notice !== ""
-          text: root.busy ? "Занято…" : root.notice
-          color: root.accentC
-          font.family: root.fam
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
+
+          Text {
+            id: viewerNotice
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: root.busy ? "Занято…" : root.notice
+            color: root.fg
+            font.family: root.fam
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
         }
 
         // навигация по краям
@@ -1109,6 +1132,7 @@ Panel {
           anchors.leftMargin: Style.space(6)
           visible: root.viewerIndex > 0
           text: "‹"
+          background: Util.alpha(Color.background, 0.88)
           foreground: root.fg
           fontFamily: root.fam
           fontSize: Style.font.title
@@ -1123,6 +1147,7 @@ Panel {
           anchors.rightMargin: Style.space(6)
           visible: root.viewerIndex >= 0 && root.viewerIndex < root.shown.length - 1
           text: "›"
+          background: Util.alpha(Color.background, 0.88)
           foreground: root.fg
           fontFamily: root.fam
           fontSize: Style.font.title
