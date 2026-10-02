@@ -15,5 +15,9 @@ previews/               # fullscreen previews
 .DS_Store
 Thumbs.db
 
+# Python bytecode (helper indexer)
+__pycache__/
+*.pyc
+
 # Herdr project state
 .herdr-project/

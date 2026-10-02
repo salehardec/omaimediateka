@@ -146,6 +146,214 @@ function filterItems(items, query) {
   return out
 }
 
+// --- поиск по содержимому (родной индекс Apple) ----------------------------
+//
+// Хелпер `oma-mediateka search` возвращает строки TSV `path<TAB>source<TAB>
+// matched`. Модель разбирает запрос зеркально Python-части, группирует
+// строки по пути, объединяет их с обычным фильтром по имени/папке, схлопывает
+// пары Live Photo и ранжирует: чем больше содержательных источников совпало,
+// тем выше элемент.
+
+var SOURCE_ORDER = ["name", "scene", "activity", "ocr", "library", "place", "people", "caption"]
+var SOURCE_LABELS = {
+  name: "имя",
+  scene: "сцена",
+  activity: "событие",
+  ocr: "текст",
+  library: "метка",
+  place: "место",
+  people: "люди",
+  caption: "caption"
+}
+
+// Те же общие окончания, что и в bin/oma-mediateka-index.py, отсортированные
+// от длинных к коротким. Отсекается одно, стем короче 4 символов не трогаем.
+var RU_SUFFIXES = [
+  "иями", "ями", "ами", "ией", "иях", "иям", "ием", "ыми", "ими", "ого",
+  "его", "ому", "ему", "ых", "их", "ая", "яя", "ое", "ее", "ые", "ие",
+  "ой", "ей", "ий", "ый", "ом", "ем", "ам", "ям", "ах", "ях", "ов", "ев",
+  "ью", "ия", "ию", "ие", "ей", "а", "я", "о", "е", "у", "ю", "ы", "и", "ь"
+]
+var RU_SUFFIXES_SORTED = RU_SUFFIXES.slice().sort(function(a, b) { return b.length - a.length })
+
+function normalizeText(s) {
+  var t = String(s || "").trim().toLowerCase().replace(/ё/g, "е")
+  return t.replace(/^[^0-9a-zа-я]+|[^0-9a-zа-я]+$/g, "")
+}
+
+function stemRu(word) {
+  var w = normalizeText(word)
+  if (w === "" || !/[а-я]/.test(w)) return w
+  for (var i = 0; i < RU_SUFFIXES_SORTED.length; i++) {
+    var suf = RU_SUFFIXES_SORTED[i]
+    if (w.length - suf.length >= 4 && w.slice(-suf.length) === suf)
+      return w.slice(0, w.length - suf.length)
+  }
+  return w
+}
+
+// Разбор запроса: нижний регистр, ё→е, токены от 2 символов. valid — можно ли
+// вообще идти в индекс (пустой/однобуквенный запрос не ищем).
+function parseQuery(query) {
+  var raw = String(query || "").trim().toLowerCase().replace(/ё/g, "е")
+  var parts = raw.split(/\s+/)
+  var tokens = []
+  for (var i = 0; i < parts.length; i++) if (parts[i].length >= 2) tokens.push(parts[i])
+  var stems = []
+  for (var j = 0; j < tokens.length; j++) stems.push(stemRu(tokens[j]))
+  return { raw: raw, tokens: tokens, stems: stems, valid: tokens.length > 0 && raw.length >= 2 }
+}
+
+function nameMatches(item, parsed) {
+  if (!item || !parsed || parsed.tokens.length === 0) return false
+  var hay = (String(item.name || "") + " " + String(item.folder || "")).toLowerCase().replace(/ё/g, "е")
+  for (var i = 0; i < parsed.tokens.length; i++)
+    if (hay.indexOf(parsed.tokens[i]) === -1) return false
+  return true
+}
+
+function parseSearchRows(raw) {
+  var out = []
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i] === "") continue
+    var parts = lines[i].split("\t")
+    if (parts.length < 3 || parts[0] === "") continue
+    out.push({ path: parts[0], source: parts[1], matched: parts.slice(2).join("\t") })
+  }
+  return out
+}
+
+// path -> { sources: [...], matched: { source: [text, …] } }
+function groupSearchRows(rows) {
+  var map = {}
+  for (var i = 0; i < (rows || []).length; i++) {
+    var r = rows[i]
+    var g = map[r.path]
+    if (!g) { g = { path: r.path, sources: [], matched: {} }; map[r.path] = g }
+    if (g.sources.indexOf(r.source) === -1) g.sources.push(r.source)
+    if (!g.matched[r.source]) g.matched[r.source] = []
+    if (g.matched[r.source].indexOf(r.matched) === -1) g.matched[r.source].push(r.matched)
+  }
+  return map
+}
+
+function sortSources(list) {
+  return (list || []).slice().sort(function(a, b) {
+    var ia = SOURCE_ORDER.indexOf(a), ib = SOURCE_ORDER.indexOf(b)
+    if (ia < 0) ia = 99
+    if (ib < 0) ib = 99
+    return ia - ib
+  })
+}
+
+function sourceLabel(source) { return SOURCE_LABELS[source] || String(source || "") }
+
+function contentSources(item) {
+  var out = []
+  var list = (item && item.sources) || []
+  for (var i = 0; i < list.length; i++) if (list[i] !== "name") out.push(list[i])
+  return sortSources(out)
+}
+
+// Короткая подпись бейджа: до двух содержательных источников, дальше «+N».
+function badgeLabel(item) {
+  var cs = contentSources(item)
+  if (cs.length === 0) return ""
+  var labels = []
+  for (var i = 0; i < cs.length && i < 2; i++) labels.push(sourceLabel(cs[i]))
+  var s = labels.join(" · ")
+  if (cs.length > 2) s += " +" + (cs.length - 2)
+  return s
+}
+
+function baseNameOf(name) {
+  var n = String(name || "")
+  var i = n.lastIndexOf(".")
+  return i > 0 ? n.slice(0, i) : n
+}
+
+function searchScore(item) {
+  var s = 0
+  var list = (item && item.sources) || []
+  for (var i = 0; i < list.length; i++) s += (list[i] === "name") ? 1 : 3
+  return s
+}
+
+function cloneItem(it) {
+  var c = {}
+  for (var k in it) c[k] = it[k]
+  return c
+}
+
+function mergeSources(dst, src) {
+  var list = (src && src.sources) || []
+  for (var i = 0; i < list.length; i++)
+    if (dst.sources.indexOf(list[i]) === -1) dst.sources.push(list[i])
+  var matched = (src && src.matched) || {}
+  for (var s in matched) {
+    if (!dst.matched[s]) dst.matched[s] = []
+    for (var j = 0; j < matched[s].length; j++)
+      if (dst.matched[s].indexOf(matched[s][j]) === -1) dst.matched[s].push(matched[s][j])
+  }
+  dst.sources = sortSources(dst.sources)
+}
+
+// Live Photo — это HEIC + MOV с одним базовым именем; в выдаче оставляем
+// фото и переносим на него источники обоих файлов.
+function dedupeLivePairs(items) {
+  var byBase = {}
+  var out = []
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    var base = baseNameOf(it.name).toLowerCase()
+    var prev = byBase[base]
+    if (prev === undefined) { byBase[base] = out.length; out.push(it); continue }
+    var kept = out[prev]
+    if (kept.kind !== it.kind) {
+      var photo = kept.kind === "photo" ? kept : it
+      if (photo !== kept) out[prev] = photo
+      mergeSources(photo, kept)
+      mergeSources(photo, it)
+      photo._pos = Math.min(kept._pos || 0, it._pos || 0)
+    } else {
+      out.push(it)
+    }
+  }
+  return out
+}
+
+// Объединяет совпадения по имени/папке с результатами индекса, дедуплицирует
+// и ранжирует. items — исходный список (в хронологическом порядке).
+function mergeSearch(items, rows, query) {
+  var parsed = parseQuery(query)
+  if (!parsed.valid) return (items || []).slice()
+  var groups = groupSearchRows(rows)
+  var out = []
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    var g = groups[it.path]
+    var nameHit = nameMatches(it, parsed)
+    if (!g && !nameHit) continue
+    var c = cloneItem(it)
+    c.sources = g ? g.sources.slice() : []
+    c.matched = {}
+    if (g) for (var s in g.matched) c.matched[s] = g.matched[s].slice()
+    if (nameHit && c.sources.indexOf("name") === -1) c.sources.unshift("name")
+    c.sources = sortSources(c.sources)
+    c._pos = i
+    out.push(c)
+  }
+  out = dedupeLivePairs(out)
+  out.sort(function(a, b) {
+    var d = searchScore(b) - searchScore(a)
+    if (d !== 0) return d
+    return (a._pos || 0) - (b._pos || 0)
+  })
+  for (var k = 0; k < out.length; k++) delete out[k]._pos
+  return out
+}
+
 // --- кэш -------------------------------------------------------------------
 
 function thumbFileName(item, variant) {
@@ -284,6 +492,20 @@ if (typeof module !== "undefined" && module.exports) {
     parseListing: parseListing,
     sortItems: sortItems,
     filterItems: filterItems,
+    parseQuery: parseQuery,
+    stemRu: stemRu,
+    normalizeText: normalizeText,
+    nameMatches: nameMatches,
+    parseSearchRows: parseSearchRows,
+    groupSearchRows: groupSearchRows,
+    mergeSearch: mergeSearch,
+    dedupeLivePairs: dedupeLivePairs,
+    searchScore: searchScore,
+    contentSources: contentSources,
+    badgeLabel: badgeLabel,
+    sourceLabel: sourceLabel,
+    sortSources: sortSources,
+    baseNameOf: baseNameOf,
     thumbPath: thumbPath,
     thumbFileName: thumbFileName,
     formatSize: formatSize,
