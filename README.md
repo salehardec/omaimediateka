@@ -22,6 +22,10 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
 - **Fullscreen viewer** — photos fit the screen; videos play inline through
   QtMultimedia. `←/→` navigates, metadata (name, date, size, duration) is shown.
 - **Live filter** by file name or folder, and newest-/oldest-first sorting.
+- **Export** (read-only on the phone): save the original to `~/Pictures/iPhone`
+  (`Ctrl+S`) or pick a folder (`Ctrl+Shift+S`); existing names get a ` (1)`, ` (2)`
+  suffix instead of being overwritten. `Ctrl+C` puts a photo in the clipboard as
+  `image/png` (HEIC is decoded with `heif-convert`), or a video's path as text.
 - **Clear states** instead of a blank screen: phone not connected, not trusted,
   `gvfs-afc` missing, no `DCIM`, mounting in progress.
 
@@ -38,6 +42,8 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
   converted with `heif-convert` before thumbnailing.
 - **`ffmpeg` / `ffprobe`** — JPEG/PNG/WebP thumbnails, video posters and duration.
 - **`qt6-multimedia-ffmpeg`** (optional) — in-widget video playback.
+- **`wl-clipboard`** (`wl-copy`) — copying to the clipboard (`Ctrl+C`).
+- **`zenity`** or **`kdialog`** (optional) — the “Save as” folder picker.
 
 On Arch:
 
@@ -108,6 +114,9 @@ Uninstall with `./install.sh --uninstall`.
 | Sort | the “newest / oldest first” button |
 | Previous / next in viewer | `← →` or the side buttons |
 | Video play / pause | `p`, `Space`, or the button |
+| Save to `~/Pictures/iPhone` | `Ctrl+S` or the “Сохранить” button |
+| Save as (pick a folder) | `Ctrl+Shift+S` or the “Сохранить как” button |
+| Copy to clipboard | `Ctrl+C` — photo as image, video as path |
 | Back to grid | `Esc` |
 | Close popup | `Esc` (from the grid) |
 
@@ -120,7 +129,11 @@ Uninstall with `./install.sh --uninstall`.
   - `status` — detects device, trust, and mount (one JSON line);
   - `list <dcim>` — a single `find` pass over media files (TSV);
   - `thumb <src> <dst> <kind> [thumb|preview]` — renders a JPEG preview into the cache;
-  - `meta <src>` — video duration and dimensions.
+  - `meta <src>` — video duration and dimensions;
+  - `names <dir>` / `copy <src> <dst>` — export: list existing names, then copy the
+    original (refuses to overwrite; the UI adds the ` (1)`, ` (2)` suffix);
+  - `clip-image <src>` / `clip-text <text>` — clipboard through `wl-copy`;
+  - `pick-dir [start]` — folder picker (`zenity`, else `kdialog`).
 - **Cache** — `~/.cache/omaimediateka/thumbs/` and `.../previews/`. Keys include the
   file size and mtime, so changed files are re-rendered and unchanged ones are reused.
 - **Sorting** — by Apple’s file numbering (folder + number), which is chronological
@@ -130,7 +143,9 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 
 ## Limitations
 
-- **Read-only.** The widget never imports, copies, or deletes anything.
+- **Read-only on the phone.** Nothing is ever deleted or modified on the iPhone;
+  export only copies originals out.
+- Export **never overwrites**: a name already present gets a ` (1)`, ` (2)`, … suffix.
 - The **interface is currently in Russian**; the code and this README are in English.
   Localization PRs are welcome.
 - Sorting follows Apple’s file numbering, **not EXIF capture date**.

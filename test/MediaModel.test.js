@@ -118,4 +118,42 @@ test("countKind", () => {
   assert.strictEqual(M.countKind(items, "video"), 2)
 })
 
+test("defaultExportDir", () => {
+  assert.strictEqual(M.defaultExportDir("/home/u"), "/home/u/Pictures/iPhone")
+  assert.strictEqual(M.defaultExportDir("/home/u/"), "/home/u/Pictures/iPhone")
+})
+
+test("sanitizeBaseName", () => {
+  assert.strictEqual(M.sanitizeBaseName("IMG_0001.HEIC"), "IMG_0001.HEIC")
+  assert.strictEqual(M.sanitizeBaseName("a/b\\c.jpg"), "a_b_c.jpg")
+  assert.strictEqual(M.sanitizeBaseName("  .hidden.jpg"), "hidden.jpg")
+  assert.strictEqual(M.sanitizeBaseName(""), "file")
+})
+
+test("uniqueName: без коллизий — имя не меняется", () => {
+  assert.strictEqual(M.uniqueName("IMG_0001.JPG", {}), "IMG_0001.JPG")
+  assert.strictEqual(M.uniqueName("IMG_0001.JPG", { "OTHER.JPG": true }), "IMG_0001.JPG")
+})
+
+test("uniqueName: суффикс (1), (2) перед расширением", () => {
+  assert.strictEqual(M.uniqueName("IMG_0001.JPG", { "IMG_0001.JPG": true }), "IMG_0001 (1).JPG")
+  const taken = { "IMG_0001.JPG": true, "IMG_0001 (1).JPG": true, "IMG_0001 (2).JPG": true }
+  assert.strictEqual(M.uniqueName("IMG_0001.JPG", taken), "IMG_0001 (3).JPG")
+})
+
+test("uniqueName: без расширения и многосегментные имена", () => {
+  assert.strictEqual(M.uniqueName("movie", { movie: true }), "movie (1)")
+  assert.strictEqual(M.uniqueName("VID_2026.01.01.MOV", { "VID_2026.01.01.MOV": true }), "VID_2026.01.01 (1).MOV")
+})
+
+test("uniqueName: опасные имена обезвреживаются", () => {
+  assert.strictEqual(M.uniqueName("../etc/passwd", {}), "_etc_passwd")
+  assert.strictEqual(M.uniqueName("../etc/passwd", { "_etc_passwd": true }), "_etc_passwd (1)")
+})
+
+test("destPath", () => {
+  assert.strictEqual(M.destPath("/home/u/Pictures/iPhone", "IMG_1.JPG"), "/home/u/Pictures/iPhone/IMG_1.JPG")
+  assert.strictEqual(M.destPath("/home/u/Pictures/iPhone/", "IMG_1.JPG"), "/home/u/Pictures/iPhone/IMG_1.JPG")
+})
+
 console.log("\n" + passed + " passed")

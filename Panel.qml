@@ -58,6 +58,13 @@ Panel {
   property bool previewFailed: false
   property var videoMeta: null
 
+  // ---------- экспорт ----------
+  property string notice: ""
+  property bool busy: false
+  property var helperQueue: []
+  property var currentJob: null
+  property string helperOut: ""
+
   readonly property real cellSize: Style.space(150)
 
   function togglePanel() { root.toggle() }
@@ -345,6 +352,110 @@ Panel {
     root.videoActive = !root.videoActive
   }
 
+  // ---------- экспорт: сохранить и в буфер ----------
+  function showNotice(text) {
+    root.notice = String(text || "")
+    noticeTimer.restart()
+  }
+
+  // Элемент, к которому применяются действия: открытый кадр или курсор сетки.
+  function actionItem() {
+    if (root.viewerIndex >= 0) return root.currentItem()
+    if (root.shown.length === 0) return null
+    var i = Math.max(0, Math.min(root.shown.length - 1, root.cursor))
+    return root.shown[i]
+  }
+
+  function enqueueJob(op, args, extra) {
+    var q = root.helperQueue.slice()
+    q.push({ op: op, args: args, extra: extra || {} })
+    root.helperQueue = q
+    root.pumpHelper()
+  }
+
+  function pumpHelper() {
+    if (helperProc.running) return
+    var q = root.helperQueue.slice()
+    if (q.length === 0) { root.busy = false; return }
+    var job = q.shift()
+    root.helperQueue = q
+    root.currentJob = job
+    root.busy = true
+    helperProc.command = [root.helper, job.op].concat(job.args)
+    helperProc.running = true
+  }
+
+  function handleHelperResult(job, code, out) {
+    if (!job) return
+    if (job.op === "names") {
+      if (code !== 0) { root.showNotice("Не удалось прочитать папку"); return }
+      var taken = {}
+      var lines = String(out || "").split("\n")
+      for (var i = 0; i < lines.length; i++) if (lines[i] !== "") taken[lines[i]] = true
+      var item = job.extra.item
+      if (!item) return
+      var dir = job.extra.dir
+      var name = Model.uniqueName(item.name, taken)
+      root.enqueueJob("copy", [item.path, Model.destPath(dir, name)], { item: item, dir: dir, name: name })
+    } else if (job.op === "copy") {
+      if (code === 0) root.showNotice("Сохранено: " + job.extra.name)
+      else if (code === 3) root.showNotice("Файл уже есть в папке")
+      else root.showNotice("Ошибка сохранения")
+    } else if (job.op === "clip-image") {
+      if (code === 0) root.showNotice("Изображение в буфере")
+      else if (code === 4) root.showNotice("wl-copy не найден")
+      else root.showNotice("Не удалось скопировать изображение")
+    } else if (job.op === "clip-text") {
+      if (code === 0) root.showNotice("Путь к файлу в буфере")
+      else if (code === 4) root.showNotice("wl-copy не найден")
+      else root.showNotice("Не удалось скопировать")
+    } else if (job.op === "pick-dir") {
+      var chosen = String(out || "").trim()
+      if (code === 0 && chosen !== "") root.enqueueJob("names", [chosen], { item: job.extra.item, dir: chosen })
+      else root.showNotice("Сохранение отменено")
+    }
+  }
+
+  // Сохранить оригинал без перекодирования. askDir=true — диалог выбора папки.
+  function saveItem(item, askDir) {
+    if (!item) { root.showNotice("Нечего сохранять"); return }
+    if (askDir) {
+      root.enqueueJob("pick-dir", [root.home + "/Pictures"], { item: item })
+    } else {
+      var dir = Model.defaultExportDir(root.home)
+      root.enqueueJob("names", [dir], { item: item, dir: dir })
+    }
+  }
+
+  // Фото — в буфер картинкой, видео и прочее — текстовым путём.
+  function copyItem(item) {
+    if (!item) { root.showNotice("Нечего копировать"); return }
+    if (item.kind === "photo") root.enqueueJob("clip-image", [item.path], { item: item })
+    else root.enqueueJob("clip-text", [item.path], { item: item })
+  }
+
+  Process {
+    id: helperProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.helperOut = String(text || "")
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code) {
+      var job = root.currentJob
+      root.currentJob = null
+      root.handleHelperResult(job, code, root.helperOut)
+      root.helperOut = ""
+      root.pumpHelper()
+    }
+  }
+
+  Timer {
+    id: noticeTimer
+    interval: 2600
+    onTriggered: root.notice = ""
+  }
+
   // ---------- подписи состояний ----------
   function stateTitle(s) {
     if (s === "no-tools") return "Нет libimobiledevice"
@@ -525,6 +636,23 @@ Panel {
       }
       onTextKey: function(text) { root.handleTextKey(text) }
 
+      // Горячие клавиши экспорта (в поле фильтра не перехватываем — там свой Ctrl+C).
+      Shortcut {
+        sequence: "Ctrl+S"
+        enabled: root.opened && !filterField.activeFocus
+        onActivated: root.saveItem(root.actionItem(), false)
+      }
+      Shortcut {
+        sequence: "Ctrl+Shift+S"
+        enabled: root.opened && !filterField.activeFocus
+        onActivated: root.saveItem(root.actionItem(), true)
+      }
+      Shortcut {
+        sequence: "Ctrl+C"
+        enabled: root.opened && !filterField.activeFocus
+        onActivated: root.copyItem(root.actionItem())
+      }
+
       // ================= сетка =================
       Item {
         id: gridPage
@@ -693,28 +821,56 @@ Panel {
           }
 
           // --- футер ---
-          RowLayout {
+          ColumnLayout {
             Layout.fillWidth: true
-            spacing: Style.space(10)
-            Text {
-              textFormat: Text.PlainText
+            spacing: Style.space(2)
+
+            RowLayout {
               Layout.fillWidth: true
-              elide: Text.ElideRight
-              text: root.deviceState === "ready"
-                ? (root.cursor >= 0 && root.cursor < root.shown.length && root.shown[root.cursor]
-                  ? root.shown[root.cursor].name
-                  : "iPhone")
-                : root.device.udid !== "" ? root.device.udid : "USB"
-              color: root.dim
-              font.family: root.fam
-              font.pixelSize: Style.font.caption
+              spacing: Style.space(10)
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                text: root.notice !== ""
+                  ? root.notice
+                  : (root.deviceState === "ready"
+                    ? (root.cursor >= 0 && root.cursor < root.shown.length && root.shown[root.cursor]
+                      ? root.shown[root.cursor].name
+                      : "iPhone")
+                    : root.device.udid !== "" ? root.device.udid : "USB")
+                color: root.notice !== "" ? root.accentC : root.dim
+                font.family: root.fam
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: root.busy ? "Занято…" : "Enter открыть · ← → ↑ ↓ · Esc закрыть"
+                color: root.busy ? root.accentC : root.dim
+                font.family: root.fam
+                font.pixelSize: Style.font.caption
+              }
             }
-            Text {
-              textFormat: Text.PlainText
-              text: "Enter открыть · ← → ↑ ↓ · Esc закрыть"
-              color: root.dim
-              font.family: root.fam
-              font.pixelSize: Style.font.caption
+
+            RowLayout {
+              Layout.fillWidth: true
+              visible: root.deviceState === "ready" && root.shown.length > 0
+              spacing: Style.space(8)
+
+              ExportActions {
+                item: root.actionItem()
+                enabled: !root.busy
+              }
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                horizontalAlignment: Text.AlignRight
+                text: "Ctrl+S сохранить · Ctrl+Shift+S как · Ctrl+C буфер"
+                color: root.dim
+                font.family: root.fam
+                font.pixelSize: Style.font.caption
+              }
             }
           }
         }
@@ -842,6 +998,10 @@ Panel {
             focusable: false
             onClicked: root.toggleVideo()
           }
+          ExportActions {
+            item: root.currentItem()
+            enabled: !root.busy
+          }
           Button {
             text: "Закрыть"
             foreground: root.fg
@@ -852,6 +1012,20 @@ Panel {
             focusable: false
             onClicked: root.closeViewer()
           }
+        }
+
+        // индикатор занятости / уведомление экспорта
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: Style.space(8)
+          textFormat: Text.PlainText
+          visible: root.busy || root.notice !== ""
+          text: root.busy ? "Занято…" : root.notice
+          color: root.accentC
+          font.family: root.fam
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
         }
 
         // навигация по краям
@@ -962,6 +1136,47 @@ Panel {
 
     Component.onCompleted: root.requestThumb(cell.modelData)
     onModelDataChanged: if (cell.modelData) root.requestThumb(cell.modelData)
+  }
+
+  // ---------- кнопки экспорта ----------
+  component ExportActions: RowLayout {
+    id: exportRow
+    property var item: null
+    spacing: Style.space(6)
+
+    Button {
+      text: "Сохранить"
+      enabled: !!exportRow.item && exportRow.enabled
+      foreground: root.fg
+      fontFamily: root.fam
+      fontSize: Style.font.caption
+      horizontalPadding: Style.space(8)
+      verticalPadding: Style.space(4)
+      focusable: false
+      onClicked: root.saveItem(exportRow.item, false)
+    }
+    Button {
+      text: "Сохранить как"
+      enabled: !!exportRow.item && exportRow.enabled
+      foreground: root.fg
+      fontFamily: root.fam
+      fontSize: Style.font.caption
+      horizontalPadding: Style.space(8)
+      verticalPadding: Style.space(4)
+      focusable: false
+      onClicked: root.saveItem(exportRow.item, true)
+    }
+    Button {
+      text: "В буфер"
+      enabled: !!exportRow.item && exportRow.enabled
+      foreground: root.fg
+      fontFamily: root.fam
+      fontSize: Style.font.caption
+      horizontalPadding: Style.space(8)
+      verticalPadding: Style.space(4)
+      focusable: false
+      onClicked: root.copyItem(exportRow.item)
+    }
   }
 
   // количество колонок (нужно moveCursor)
