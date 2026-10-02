@@ -413,9 +413,19 @@ Panel {
   Component.onCompleted: root.refreshStatus()
 
   // ---------- кнопка в баре ----------
-  readonly property real pillMargin: Style.space(3)
+  // Активный бар (salehardec.bar) кладёт `chipSpacing` между виджетами одной
+  // секции, но не оставляет его на границе с центральным «якорем». Из-за этого
+  // пилюля, прижатая справа к якорю, получает слева зазор на весь chipSpacing
+  // больше, чем справа. Сдвигаем пилюлю на половину этого зазора влево и на
+  // столько же сужаем слот — тогда видимые зазоры с обеих сторон совпадают с
+  // соседними виджетами. На баре без chipSpacing (штатный omarchy.bar)
+  // компенсация выключена.
+  readonly property real barChipSpacing: (root.bar && typeof root.bar.chipSpacing === "number")
+    ? root.bar.chipSpacing : 0
+  readonly property real pillShift: barChipSpacing / 2
+  readonly property real pillSlotTrim: barChipSpacing > 0 ? 4 : 0
 
-  implicitWidth: pill.implicitWidth + pillMargin * 2
+  implicitWidth: pill.implicitWidth - pillSlotTrim
   implicitHeight: root.barSize || Style.space(26)
 
   Item {
@@ -423,6 +433,7 @@ Panel {
     implicitWidth: pillContent.implicitWidth + Style.space(18)
     implicitHeight: Math.max(Style.space(20), (root.barSize || Style.space(26)) - Style.space(6))
     anchors.centerIn: parent
+    anchors.horizontalCenterOffset: -root.pillShift
 
     Rectangle {
       anchors.fill: parent
