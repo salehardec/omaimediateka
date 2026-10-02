@@ -11,6 +11,8 @@
 #   thumb <src> <dst> <kind> [variant]
 #                               — превью JPEG в кэш (variant: thumb|preview)
 #   meta <src>                  — длительность/размеры (video), TSV
+#   index [mount]               — кэш родного индекса Apple для поиска по смыслу
+#   search <query>              — TSV path<TAB>source<TAB>matched
 #
 # Коды выхода: 0 — успех, 1 — нет данных/ошибка.
 set -u
@@ -18,6 +20,10 @@ set -u
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 GVFS_DIR="$RUNTIME/gvfs"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omaimediateka"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INDEX_PY="$HERE/oma-mediateka-index.py"
+INDEX_DIR="$CACHE_DIR/apple-index"
+SEARCH_DB="$CACHE_DIR/search.sqlite"
 
 # --- утилиты ---------------------------------------------------------------
 
@@ -252,6 +258,37 @@ cmd_pick_dir() {
   fi
 }
 
+# --- поиск по содержимому (родной индекс Apple) ----------------------------
+
+# index [mount] — копирует базы с iPhone (только чтение) и собирает компактный
+# sqlite-кэш. Инкрементально: при том же -wal и том же устройстве ничего не
+# делает. Печатает прогресс; код 0 — индекс готов, 1 — нет телефона/баз, 4 —
+# нет python3.
+cmd_index() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Для поиска по содержимому нужен python3" >&2
+    return 4
+  fi
+  local mount="${1:-}"
+  [ -n "$mount" ] || mount="$(find_afc_mount "" || true)"
+  [ -n "$mount" ] || { echo "iPhone не смонтирован" >&2; return 1; }
+  local udid
+  udid="$(basename "$mount")"
+  udid="${udid#afc:host=}"
+  python3 "$INDEX_PY" index "$mount" "$INDEX_DIR" "$SEARCH_DB" "$udid"
+}
+
+# search <query> — TSV path<TAB>source<TAB>matched из локального кэша.
+cmd_search() {
+  local query="${1:-}"
+  [ -n "$query" ] || return 0
+  [ -f "$SEARCH_DB" ] || return 1
+  if ! command -v python3 >/dev/null 2>&1; then return 4; fi
+  local mount
+  mount="$(find_afc_mount "" || true)"
+  python3 "$INDEX_PY" search "$mount" "$SEARCH_DB" "$query"
+}
+
 # --- dispatch --------------------------------------------------------------
 
 case "${1:-}" in
@@ -264,6 +301,8 @@ case "${1:-}" in
   clip-image) shift; cmd_clip_image "$@" ;;
   clip-text)  shift; cmd_clip_text "$@" ;;
   pick-dir)   shift; cmd_pick_dir "$@" ;;
+  index)      shift; cmd_index "$@" ;;
+  search)     shift; cmd_search "$@" ;;
   *)
     cat >&2 <<'USAGE'
 usage: oma-mediateka <command> [args]
@@ -276,6 +315,8 @@ usage: oma-mediateka <command> [args]
   clip-image <src>
   clip-text <text>
   pick-dir [start]
+  index [mount]
+  search <query>
 USAGE
     exit 2
     ;;

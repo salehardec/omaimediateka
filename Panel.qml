@@ -46,6 +46,17 @@ Panel {
   property int viewerIndex: -1
   property bool videoActive: false
 
+  // ---------- поиск по содержимому ----------
+  property var searchRows: []
+  property string rowsQuery: ""
+  property bool indexReady: false
+  property bool indexRunning: false
+  property string indexStatus: ""
+  property string indexError: ""
+  property bool searchRunning: false
+  property string runningQuery: ""
+  property bool searchQueued: false
+
   // ---------- превью ----------
   property var thumbState: ({})
   property var thumbRequested: ({})
@@ -107,6 +118,7 @@ Panel {
         root.currentDcim = String(d.dcim || "")
         root.loadList()
       }
+      if (prev !== "ready") indexKick.restart()
     } else {
       if (prev === "ready") root.resetMedia()
       root.currentDcim = ""
@@ -124,6 +136,9 @@ Panel {
     root.previewReady = false
     root.viewerIndex = -1
     root.videoActive = false
+    root.searchRows = []
+    root.rowsQuery = ""
+    root.searchQueued = false
   }
 
   Process {
@@ -163,12 +178,112 @@ Panel {
   }
 
   function recompute() {
-    root.shown = Model.filterItems(root.items, root.query)
+    var useIndex = root.indexReady && root.rowsQuery === root.query && Model.parseQuery(root.query).valid
+    root.shown = useIndex
+      ? Model.mergeSearch(root.items, root.searchRows, root.query)
+      : Model.filterItems(root.items, root.query)
     if (root.cursor >= root.shown.length) root.cursor = Math.max(0, root.shown.length - 1)
     if (root.viewerIndex >= root.shown.length) root.viewerIndex = root.shown.length - 1
   }
 
-  onQueryChanged: root.recompute()
+  onQueryChanged: {
+    root.recompute()
+    searchDebounce.restart()
+  }
+
+  // ---------- поиск по содержимому: индекс Apple ----------
+  // Индекс лежит в ~/.cache/omaimediateka/search.sqlite и пересобирается при
+  // подключении телефона (инкрементально) или по кнопке. Пока он не готов,
+  // фильтр ищет только по имени и папке и не ждёт индексацию.
+  function runSearch() {
+    if (root.deviceState !== "ready") return
+    var q = Model.parseQuery(root.query)
+    if (!root.indexReady || !q.valid) {
+      root.searchRows = []
+      root.rowsQuery = ""
+      root.recompute()
+      return
+    }
+    if (searchProc.running) { root.searchQueued = true; return }
+    root.runningQuery = root.query
+    root.searchRunning = true
+    searchProc.command = [root.helper, "search", root.query]
+    searchProc.running = true
+  }
+
+  function applySearch(raw) {
+    if (root.runningQuery === root.query) {
+      root.searchRows = Model.parseSearchRows(String(raw || ""))
+      root.rowsQuery = root.runningQuery
+    }
+    root.recompute()
+  }
+
+  function startIndex() {
+    if (root.indexRunning || root.deviceState !== "ready") return
+    root.indexRunning = true
+    root.indexStatus = "Проверяю индекс…"
+    root.indexError = ""
+    indexProc.command = [root.helper, "index"]
+    indexProc.running = true
+  }
+
+  Timer {
+    id: searchDebounce
+    interval: 250
+    onTriggered: root.runSearch()
+  }
+
+  // Даём интерфейсу сначала показать сетку и превью, и только потом качаем базы.
+  Timer {
+    id: indexKick
+    interval: 1500
+    onTriggered: root.startIndex()
+  }
+
+  Process {
+    id: searchProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applySearch(String(text || ""))
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code) {
+      root.searchRunning = false
+      if (root.searchQueued) { root.searchQueued = false; root.runSearch() }
+    }
+  }
+
+  Process {
+    id: indexProc
+    stdout: SplitParser {
+      onRead: function(line) {
+        var t = String(line || "").trim()
+        if (t !== "") root.indexStatus = t
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        var t = String(line || "").trim()
+        if (t !== "") root.indexError = t
+      }
+    }
+    onExited: function(code) {
+      root.indexRunning = false
+      if (code === 0) {
+        var wasReady = root.indexReady
+        root.indexReady = true
+        root.indexError = ""
+        root.indexStatus = ""
+        if (!wasReady) root.showNotice("Поиск по содержимому готов")
+        root.runSearch()
+      } else {
+        root.indexReady = false
+        if (root.indexError === "")
+          root.indexError = code === 4 ? "Нужен python3" : "Индекс Apple недоступен"
+      }
+    }
+  }
 
   function setSort(order) {
     root.sortOrder = order
@@ -252,6 +367,9 @@ Panel {
     root.viewerIndex = index
     root.cursor = index
     root.videoActive = false
+    // Уводим фокус из строки фильтра: иначе открытие кадра по Enter оставляет
+    // фокус в поле, и горячие клавиши экспорта в просмотрщике отключены.
+    keyCatcher.forceActiveFocus()
     root.updatePreview()
   }
   function closeViewer() {
@@ -830,7 +948,9 @@ Panel {
             TextField {
               id: filterField
               Layout.fillWidth: true
-              placeholderText: "имя файла, папка…"
+              placeholderText: root.indexReady
+                ? "имя файла, папка, содержимое…"
+                : "имя файла, папка…"
               foreground: root.fg
               font.family: root.fam
               horizontalPadding: Style.space(10)
@@ -857,6 +977,31 @@ Panel {
               focusable: false
               onClicked: root.toggleSort()
             }
+            Button {
+              text: root.indexRunning ? "Индексация…" : "Обновить поиск"
+              enabled: !root.indexRunning
+              foreground: root.fg
+              fontFamily: root.fam
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(6)
+              focusable: false
+              onClicked: root.startIndex()
+            }
+          }
+
+          // --- состояние индекса поиска по содержимому ---
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            visible: root.indexRunning || root.indexError !== ""
+            elide: Text.ElideRight
+            text: root.indexRunning
+              ? (root.indexStatus !== "" ? root.indexStatus : "Индексирую…")
+              : root.indexError
+            color: root.indexError !== "" ? root.urgentC : root.dim
+            font.family: root.fam
+            font.pixelSize: Style.font.caption
           }
 
           // --- сетка ---
@@ -1056,6 +1201,7 @@ Panel {
               parts.push(Model.formatSize(it.size))
               if (it.kind === "video" && root.videoMeta && root.videoMeta.duration > 0)
                 parts.push(Model.formatDuration(root.videoMeta.duration))
+              if (Model.badgeLabel(it) !== "") parts.push(Model.badgeLabel(it))
               return parts.join("  ·  ")
             }
             color: root.fg
@@ -1222,6 +1368,34 @@ Panel {
           font.family: root.fam
           font.pixelSize: Style.font.caption
         }
+      }
+    }
+
+    // бейдж источника: почему элемент в выдаче поиска по содержимому
+    Rectangle {
+      anchors.top: parent.top
+      anchors.right: parent.right
+      anchors.margins: Style.space(4)
+      visible: badgeText.text !== ""
+      width: Math.min(cell.width - Style.space(12), badgeText.implicitWidth + Style.space(10))
+      height: badgeText.implicitHeight + Style.space(5)
+      radius: Style.space(4)
+      color: Util.alpha(Color.background, 0.72)
+      border.width: Style.space(1)
+      border.color: Util.alpha(root.fg, 0.18)
+      z: 5
+      Text {
+        id: badgeText
+        anchors.centerIn: parent
+        width: parent.width - Style.space(6)
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
+        text: cell.modelData ? Model.badgeLabel(cell.modelData) : ""
+        color: root.fg
+        font.family: root.fam
+        font.pixelSize: Style.font.caption
+        font.bold: true
       }
     }
 
