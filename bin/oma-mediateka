@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# oma-mediateka — системный хелпер плагина Omaimediateka.
+#
+# Доступ к DCIM iPhone через gvfs-afc (см. docs/superpowers/specs). Скрипт
+# ничего не монтирует от root: gvfs монтирует пользовательская сессия, а
+# usbmuxd поднимает udev при подключении кабеля.
+#
+# Подкоманды:
+#   status                      — состояние устройства одной JSON-строкой
+#   list <dcim>                 — TSV листинг медиафайлов (mtime, size, path)
+#   thumb <src> <dst> <kind> [variant]
+#                               — превью JPEG в кэш (variant: thumb|preview)
+#   meta <src>                  — длительность/размеры (video), TSV
+#
+# Коды выхода: 0 — успех, 1 — нет данных/ошибка.
+set -u
+
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+GVFS_DIR="$RUNTIME/gvfs"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omaimediateka"
+
+# --- утилиты ---------------------------------------------------------------
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g'
+}
+
+emit() {
+  # state backend udid mount dcim message
+  printf '{"state":"%s","backend":"%s","udid":"%s","mount":"%s","dcim":"%s","message":"%s"}\n' \
+    "$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "$3")" \
+    "$(json_escape "$4")" "$(json_escape "$5")" "$(json_escape "$6")"
+}
+
+# Находит каталог монтирования afc для UDID (или любой, если UDID пуст).
+find_afc_mount() {
+  local udid="${1:-}" d name
+  for d in "$GVFS_DIR"/afc:host=*; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    if [ -z "$udid" ] || [[ "$name" == "afc:host=$udid"* ]]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --- status ----------------------------------------------------------------
+
+cmd_status() {
+  if ! command -v idevice_id >/dev/null 2>&1; then
+    emit "no-tools" "none" "" "" "" \
+      "Не установлен libimobiledevice. Установите: sudo pacman -S libimobiledevice usbmuxd"
+    return 0
+  fi
+
+  local udids udid
+  udids="$(idevice_id -l 2>/dev/null)"
+  if [ -z "$udids" ]; then
+    emit "no-device" "none" "" "" "" \
+      "iPhone не подключён. Подключите кабелем, разблокируйте и нажмите «Доверять»."
+    return 0
+  fi
+  udid="$(printf '%s\n' "$udids" | head -n1)"
+
+  local paired=1
+  if command -v idevicepair >/dev/null 2>&1; then
+    idevicepair -u "$udid" validate >/dev/null 2>&1 || paired=0
+  fi
+
+  local backend="none"
+  if [ -x /usr/lib/gvfsd-afc ] || [ -x /usr/lib/gvfs/gvfsd-afc ] \
+     || pacman -Qq gvfs-afc >/dev/null 2>&1; then
+    backend="gvfs"
+  elif command -v ifuse >/dev/null 2>&1; then
+    backend="ifuse"
+  fi
+
+  local mount=""
+  mount="$(find_afc_mount "$udid" || true)"
+
+  if [ -z "$mount" ] && [ "$paired" = 1 ] && [ "$backend" = "gvfs" ]; then
+    timeout 15 gio mount "afc://$udid/" >/dev/null 2>&1 || true
+    mount="$(find_afc_mount "$udid" || true)"
+  fi
+
+  local dcim=""
+  [ -n "$mount" ] && dcim="$mount/DCIM"
+
+  if [ -n "$mount" ] && [ -d "$dcim" ]; then
+    emit "ready" "$backend" "$udid" "$mount" "$dcim" ""
+  elif [ -n "$mount" ]; then
+    emit "no-dcim" "$backend" "$udid" "$mount" "" \
+      "Разблокируйте iPhone и подтвердите доступ к фото."
+  elif [ "$paired" != 1 ]; then
+    emit "unpaired" "$backend" "$udid" "" "" \
+      "iPhone не доверяет компьютеру. Нажмите «Доверять» на телефоне; при необходимости: idevicepair -u $udid pair"
+  elif [ "$backend" = "none" ]; then
+    emit "no-backend" "none" "$udid" "" "" \
+      "Нет доступа к файлам iPhone. Установите: sudo pacman -S gvfs-afc"
+  else
+    emit "mounting" "$backend" "$udid" "" "" \
+      "Монтирование iPhone… Если не помогает, переподключите кабель."
+  fi
+}
+
+# --- list ------------------------------------------------------------------
+
+cmd_list() {
+  local dcim="${1:-}"
+  [ -n "$dcim" ] || { echo "usage: oma-mediateka list <dcim>" >&2; return 2; }
+  [ -d "$dcim" ] || return 0
+
+  find -L "$dcim" -type f \
+    ! -name '.*' ! -path '*/__MACOSX/*' \
+    ! -iname '*.aae' ! -iname '*.thm' ! -iname '*.xmp' \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
+       -o -iname '*.heif' -o -iname '*.webp' -o -iname '*.gif' \
+       -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' \) \
+    -printf '%T@\t%s\t%p\n' 2>/dev/null
+}
+
+# --- thumb -----------------------------------------------------------------
+
+cmd_thumb() {
+  local src="${1:-}" dst="${2:-}" kind="${3:-photo}" variant="${4:-thumb}"
+  [ -n "$src" ] && [ -n "$dst" ] || { echo "usage: oma-mediateka thumb <src> <dst> <kind> [variant]" >&2; return 2; }
+  [ -s "$dst" ] && return 0
+
+  local max=384
+  [ "$variant" = "preview" ] && max=2048
+
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+  local tmp
+  tmp="$(mktemp --suffix=.jpg "${dst}.XXXXXX" 2>/dev/null)" || return 1
+  local scale="scale=min(${max}\,iw):min(${max}\,ih):force_original_aspect_ratio=decrease"
+  local ext="${src##*.}"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+  local ok=0
+
+  case "$kind" in
+    photo)
+      if [ "$ext" = "heic" ] || [ "$ext" = "heif" ]; then
+        local td
+        td="$(mktemp -d)"
+        if heif-convert -q 85 "$src" "$td/img.jpg" >/dev/null 2>&1; then
+          local first
+          first="$(ls "$td"/*.jpg 2>/dev/null | head -n1)"
+          if [ -n "$first" ] && \
+             ffmpeg -y -loglevel error -i "$first" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+            ok=1
+          fi
+        fi
+        rm -rf "$td"
+      else
+        if ffmpeg -y -loglevel error -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+          ok=1
+        fi
+      fi
+      ;;
+    video)
+      if ffmpeg -y -loglevel error -ss 0.5 -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+        ok=1
+      fi
+      ;;
+  esac
+
+  if [ "$ok" = 1 ] && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$dst"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# --- meta ------------------------------------------------------------------
+
+cmd_meta() {
+  local src="${1:-}"
+  [ -n "$src" ] || { echo "usage: oma-mediateka meta <src>" >&2; return 2; }
+  command -v ffprobe >/dev/null 2>&1 || return 1
+  local dur w h
+  dur="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  w="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  h="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  printf '%s\t%s\t%s\n' "${dur:-0}" "${w:-0}" "${h:-0}"
+}
+
+# --- export ----------------------------------------------------------------
+
+# Список имён в каталоге (каталог создаётся при отсутствии). Одно имя на строку.
+cmd_names() {
+  local dir="${1:-}"
+  [ -n "$dir" ] || { echo "usage: oma-mediateka names <dir>" >&2; return 2; }
+  mkdir -p "$dir" 2>/dev/null || return 1
+  find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null
+}
+
+# Копирование оригинала без перекодирования. Никогда не перезаписывает:
+# если приёмник существует — код 3 (вызывающий подбирает суффикс).
+cmd_copy() {
+  local src="${1:-}" dst="${2:-}"
+  [ -n "$src" ] && [ -n "$dst" ] || { echo "usage: oma-mediateka copy <src> <dst>" >&2; return 2; }
+  [ -f "$src" ] || { echo "source not found: $src" >&2; return 1; }
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+  if [ -e "$dst" ]; then echo "exists" >&2; return 3; fi
+  cp -- "$src" "$dst" 2>/dev/null || return 1
+  printf '%s\n' "$dst"
+}
+
+# Фото в буфер обмена как image/png (HEIC декодируется heif-convert).
+cmd_clip_image() {
+  local src="${1:-}"
+  [ -n "$src" ] || { echo "usage: oma-mediateka clip-image <src>" >&2; return 2; }
+  command -v wl-copy >/dev/null 2>&1 || return 4
+  local ext; ext="$(printf '%s' "${src##*.}" | tr 'A-Z' 'a-z')"
+  local td png
+  td="$(mktemp -d)" || return 1
+  if [ "$ext" = "heic" ] || [ "$ext" = "heif" ]; then
+    heif-convert -q 92 "$src" "$td/img.png" >/dev/null 2>&1 || true
+  else
+    ffmpeg -y -loglevel error -i "$src" -frames:v 1 "$td/img.png" >/dev/null 2>&1 || true
+  fi
+  png="$(ls "$td"/*.png 2>/dev/null | head -n1)"
+  if [ -n "$png" ] && [ -s "$png" ]; then
+    wl-copy --type image/png < "$png"
+    local rc=$?
+    rm -rf "$td"
+    return $rc
+  fi
+  rm -rf "$td"
+  return 1
+}
+
+# Текст (путь к файлу видео/прочего) в буфер обмена.
+cmd_clip_text() {
+  local text="${1:-}"
+  command -v wl-copy >/dev/null 2>&1 || return 4
+  printf '%s' "$text" | wl-copy
+}
+
+# Выбор каталога: zenity, иначе kdialog. Путь печатается в stdout.
+cmd_pick_dir() {
+  local start="${1:-$HOME}"
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --file-selection --directory --title="Куда сохранить" --filename="$start/" 2>/dev/null
+  elif command -v kdialog >/dev/null 2>&1; then
+    kdialog --getexistingdirectory "$start" 2>/dev/null
+  else
+    return 4
+  fi
+}
+
+# --- dispatch --------------------------------------------------------------
+
+case "${1:-}" in
+  status) cmd_status ;;
+  list)   shift; cmd_list "$@" ;;
+  thumb)  shift; cmd_thumb "$@" ;;
+  meta)   shift; cmd_meta "$@" ;;
+  names)  shift; cmd_names "$@" ;;
+  copy)   shift; cmd_copy "$@" ;;
+  clip-image) shift; cmd_clip_image "$@" ;;
+  clip-text)  shift; cmd_clip_text "$@" ;;
+  pick-dir)   shift; cmd_pick_dir "$@" ;;
+  *)
+    cat >&2 <<'USAGE'
+usage: oma-mediateka <command> [args]
+  status
+  list <dcim>
+  thumb <src> <dst> <kind> [thumb|preview]
+  meta <src>
+  names <dir>
+  copy <src> <dst>
+  clip-image <src>
+  clip-text <text>
+  pick-dir [start]
+USAGE
+    exit 2
+    ;;
+esac
