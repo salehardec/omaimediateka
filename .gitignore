@@ -1,0 +1,19 @@
+# Quickshell / runtime
+*.qslog
+
+# Generated media caches (kept in ~/.cache, never in the repo)
+thumbs/                 # grid thumbnails
+previews/               # fullscreen previews
+.cache/                 # any local cache dir created inside the tree
+
+# Helper output and logs
+*.tsv                   # DCIM listings from bin/oma-mediateka
+*.log                   # shell / helper logs
+
+# Editor and OS noise
+*~                      # emacs/editor backup files
+.DS_Store
+Thumbs.db
+
+# Herdr project state
+.herdr-project/
