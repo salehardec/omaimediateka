@@ -187,6 +187,71 @@ cmd_meta() {
   printf '%s\t%s\t%s\n' "${dur:-0}" "${w:-0}" "${h:-0}"
 }
 
+# --- export ----------------------------------------------------------------
+
+# Список имён в каталоге (каталог создаётся при отсутствии). Одно имя на строку.
+cmd_names() {
+  local dir="${1:-}"
+  [ -n "$dir" ] || { echo "usage: oma-mediateka names <dir>" >&2; return 2; }
+  mkdir -p "$dir" 2>/dev/null || return 1
+  find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null
+}
+
+# Копирование оригинала без перекодирования. Никогда не перезаписывает:
+# если приёмник существует — код 3 (вызывающий подбирает суффикс).
+cmd_copy() {
+  local src="${1:-}" dst="${2:-}"
+  [ -n "$src" ] && [ -n "$dst" ] || { echo "usage: oma-mediateka copy <src> <dst>" >&2; return 2; }
+  [ -f "$src" ] || { echo "source not found: $src" >&2; return 1; }
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+  if [ -e "$dst" ]; then echo "exists" >&2; return 3; fi
+  cp -- "$src" "$dst" 2>/dev/null || return 1
+  printf '%s\n' "$dst"
+}
+
+# Фото в буфер обмена как image/png (HEIC декодируется heif-convert).
+cmd_clip_image() {
+  local src="${1:-}"
+  [ -n "$src" ] || { echo "usage: oma-mediateka clip-image <src>" >&2; return 2; }
+  command -v wl-copy >/dev/null 2>&1 || return 4
+  local ext; ext="$(printf '%s' "${src##*.}" | tr 'A-Z' 'a-z')"
+  local td png
+  td="$(mktemp -d)" || return 1
+  if [ "$ext" = "heic" ] || [ "$ext" = "heif" ]; then
+    heif-convert -q 92 "$src" "$td/img.png" >/dev/null 2>&1 || true
+  else
+    ffmpeg -y -loglevel error -i "$src" -frames:v 1 "$td/img.png" >/dev/null 2>&1 || true
+  fi
+  png="$(ls "$td"/*.png 2>/dev/null | head -n1)"
+  if [ -n "$png" ] && [ -s "$png" ]; then
+    wl-copy --type image/png < "$png"
+    local rc=$?
+    rm -rf "$td"
+    return $rc
+  fi
+  rm -rf "$td"
+  return 1
+}
+
+# Текст (путь к файлу видео/прочего) в буфер обмена.
+cmd_clip_text() {
+  local text="${1:-}"
+  command -v wl-copy >/dev/null 2>&1 || return 4
+  printf '%s' "$text" | wl-copy
+}
+
+# Выбор каталога: zenity, иначе kdialog. Путь печатается в stdout.
+cmd_pick_dir() {
+  local start="${1:-$HOME}"
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --file-selection --directory --title="Куда сохранить" --filename="$start/" 2>/dev/null
+  elif command -v kdialog >/dev/null 2>&1; then
+    kdialog --getexistingdirectory "$start" 2>/dev/null
+  else
+    return 4
+  fi
+}
+
 # --- dispatch --------------------------------------------------------------
 
 case "${1:-}" in
@@ -194,6 +259,11 @@ case "${1:-}" in
   list)   shift; cmd_list "$@" ;;
   thumb)  shift; cmd_thumb "$@" ;;
   meta)   shift; cmd_meta "$@" ;;
+  names)  shift; cmd_names "$@" ;;
+  copy)   shift; cmd_copy "$@" ;;
+  clip-image) shift; cmd_clip_image "$@" ;;
+  clip-text)  shift; cmd_clip_text "$@" ;;
+  pick-dir)   shift; cmd_pick_dir "$@" ;;
   *)
     cat >&2 <<'USAGE'
 usage: oma-mediateka <command> [args]
@@ -201,6 +271,11 @@ usage: oma-mediateka <command> [args]
   list <dcim>
   thumb <src> <dst> <kind> [thumb|preview]
   meta <src>
+  names <dir>
+  copy <src> <dst>
+  clip-image <src>
+  clip-text <text>
+  pick-dir [start]
 USAGE
     exit 2
     ;;

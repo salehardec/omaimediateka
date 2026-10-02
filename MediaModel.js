@@ -207,6 +207,50 @@ function countKind(items, kind) {
   return n
 }
 
+// --- экспорт ---------------------------------------------------------------
+
+// Каталог экспорта по умолчанию.
+function defaultExportDir(home) {
+  var h = String(home || "").replace(/\/+$/, "")
+  return h + "/Pictures/iPhone"
+}
+
+// Безопасное базовое имя: без путей, без ведущих точек, без управляющих
+// символов. Пустое -> "file".
+function sanitizeBaseName(name) {
+  var n = String(name || "").trim()
+  n = n.replace(/[\/\\]/g, "_")
+  n = n.replace(/^[.\s]+/, "")
+  n = n.replace(/[\u0000-\u001f]/g, "")
+  if (n === "") n = "file"
+  return n
+}
+
+function splitExt(name) {
+  var i = String(name).lastIndexOf(".")
+  if (i <= 0) return [String(name), ""]
+  return [String(name).slice(0, i), String(name).slice(i)]
+}
+
+// Уникальное имя в каталоге: если `taken[name]` занято, добавляет
+// суффикс " (1)", " (2)", … перед расширением (как файловые менеджеры).
+// taken — map имя -> true.
+function uniqueName(name, taken) {
+  var safe = sanitizeBaseName(name)
+  var map = taken || {}
+  if (map[safe] !== true) return safe
+  var parts = splitExt(safe)
+  var base = parts[0], ext = parts[1]
+  var i = 1
+  while (map[base + " (" + i + ")" + ext] === true) i++
+  return base + " (" + i + ")" + ext
+}
+
+function destPath(dir, name) {
+  var d = String(dir || "").replace(/\/+$/, "")
+  return d + "/" + name
+}
+
 function findIndexByKey(items, key) {
   for (var i = 0; i < (items || []).length; i++) if (items[i].key === key) return i
   return -1
@@ -225,6 +269,11 @@ if (typeof module !== "undefined" && module.exports) {
     formatTime: formatTime,
     countKind: countKind,
     findIndexByKey: findIndexByKey,
+    defaultExportDir: defaultExportDir,
+    sanitizeBaseName: sanitizeBaseName,
+    splitExt: splitExt,
+    uniqueName: uniqueName,
+    destPath: destPath,
     hashKey: hashKey,
     numericKey: numericKey,
     folderKey: folderKey,
