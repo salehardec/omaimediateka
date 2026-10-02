@@ -156,4 +156,31 @@ test("destPath", () => {
   assert.strictEqual(M.destPath("/home/u/Pictures/iPhone/", "IMG_1.JPG"), "/home/u/Pictures/iPhone/IMG_1.JPG")
 })
 
+test("allocateNames: учитывает файлы в папке и коллизии внутри пачки", () => {
+  assert.deepStrictEqual(
+    M.allocateNames(["a.jpg", "b.jpg"], {}),
+    ["a.jpg", "b.jpg"]
+  )
+  assert.deepStrictEqual(
+    M.allocateNames(["a.jpg", "a.jpg", "a.jpg"], { "a.jpg": true }),
+    ["a (1).jpg", "a (2).jpg", "a (3).jpg"]
+  )
+  assert.deepStrictEqual(
+    M.allocateNames(["IMG_1.HEIC", "IMG_1.HEIC"], { "IMG_1.HEIC": true, "IMG_1 (1).HEIC": true }),
+    ["IMG_1 (2).HEIC", "IMG_1 (3).HEIC"]
+  )
+  assert.deepStrictEqual(M.allocateNames([], { x: true }), [])
+})
+
+test("fileWord: русское склонение", () => {
+  assert.strictEqual(M.fileWord(1), "файл")
+  assert.strictEqual(M.fileWord(2), "файла")
+  assert.strictEqual(M.fileWord(4), "файла")
+  assert.strictEqual(M.fileWord(5), "файлов")
+  assert.strictEqual(M.fileWord(11), "файлов")
+  assert.strictEqual(M.fileWord(21), "файл")
+  assert.strictEqual(M.fileWord(22), "файла")
+  assert.strictEqual(M.fileWord(0), "файлов")
+})
+
 console.log("\n" + passed + " passed")

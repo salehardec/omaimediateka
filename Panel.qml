@@ -65,6 +65,17 @@ Panel {
   property var currentJob: null
   property string helperOut: ""
 
+  // ---------- выбор для пакетного экспорта ----------
+  property var selection: ({})
+  property int batchTotal: 0
+  property int batchDone: 0
+  property int batchErrors: 0
+  readonly property int selectionCount: {
+    var n = 0
+    for (var k in root.selection) if (root.selection[k] === true) n++
+    return n
+  }
+
   readonly property real cellSize: Style.space(150)
 
   function togglePanel() { root.toggle() }
@@ -105,6 +116,7 @@ Panel {
   function resetMedia() {
     root.items = []
     root.shown = []
+    root.selection = ({})
     root.thumbState = ({})
     root.thumbRequested = ({})
     root.thumbQueue = []
@@ -136,6 +148,7 @@ Panel {
     root.thumbState = ({})
     root.thumbRequested = ({})
     root.thumbQueue = []
+    root.selection = ({})
     root.recompute()
   }
 
@@ -392,46 +405,94 @@ Panel {
       var taken = {}
       var lines = String(out || "").split("\n")
       for (var i = 0; i < lines.length; i++) if (lines[i] !== "") taken[lines[i]] = true
-      var item = job.extra.item
-      if (!item) return
+      var items = job.extra.items || (job.extra.item ? [job.extra.item] : [])
+      if (items.length === 0) return
       var dir = job.extra.dir
-      var name = Model.uniqueName(item.name, taken)
-      root.enqueueJob("copy", [item.path, Model.destPath(dir, name)], { item: item, dir: dir, name: name })
+      var rawNames = []
+      for (var j = 0; j < items.length; j++) rawNames.push(items[j].name)
+      var names = Model.allocateNames(rawNames, taken)
+      root.batchTotal = items.length
+      root.batchDone = 0
+      root.batchErrors = 0
+      for (var c = 0; c < items.length; c++)
+        root.enqueueJob("copy", [items[c].path, Model.destPath(dir, names[c])], { item: items[c], name: names[c] })
     } else if (job.op === "copy") {
-      if (code === 0) root.showNotice("Сохранено: " + job.extra.name)
-      else if (code === 3) root.showNotice("Файл уже есть в папке")
-      else root.showNotice("Ошибка сохранения")
+      root.batchDone++
+      if (code !== 0) root.batchErrors++
+      if (root.batchDone >= root.batchTotal) {
+        if (root.batchErrors === 0 && root.batchTotal === 1) root.showNotice("Сохранено: " + job.extra.name)
+        else if (root.batchErrors === 0) root.showNotice("Сохранено: " + root.batchTotal + " " + Model.fileWord(root.batchTotal))
+        else root.showNotice("Сохранено: " + (root.batchTotal - root.batchErrors) + " из " + root.batchTotal)
+        root.batchTotal = 0
+        root.batchDone = 0
+        root.batchErrors = 0
+      }
     } else if (job.op === "clip-image") {
       if (code === 0) root.showNotice("Изображение в буфере")
       else if (code === 4) root.showNotice("wl-copy не найден")
       else root.showNotice("Не удалось скопировать изображение")
     } else if (job.op === "clip-text") {
-      if (code === 0) root.showNotice("Путь к файлу в буфере")
+      if (code === 0) root.showNotice(root.selectionCount > 1 ? "Пути в буфере" : "Путь к файлу в буфере")
       else if (code === 4) root.showNotice("wl-copy не найден")
       else root.showNotice("Не удалось скопировать")
     } else if (job.op === "pick-dir") {
       var chosen = String(out || "").trim()
-      if (code === 0 && chosen !== "") root.enqueueJob("names", [chosen], { item: job.extra.item, dir: chosen })
+      if (code === 0 && chosen !== "") root.enqueueJob("names", [chosen], { items: job.extra.items, dir: chosen })
       else root.showNotice("Сохранение отменено")
     }
   }
 
-  // Сохранить оригинал без перекодирования. askDir=true — диалог выбора папки.
-  function saveItem(item, askDir) {
-    if (!item) { root.showNotice("Нечего сохранять"); return }
+  // ---------- выбор ----------
+  function toggleSelect(item) {
+    if (!item || !item.key) return
+    var s = {}
+    for (var k in root.selection) s[k] = root.selection[k]
+    if (s[item.key] === true) delete s[item.key]
+    else s[item.key] = true
+    root.selection = s
+  }
+  function clearSelection() { root.selection = ({}) }
+  function selectAll() {
+    var s = {}
+    for (var i = 0; i < root.shown.length; i++) s[root.shown[i].key] = true
+    root.selection = s
+  }
+  function selectedItems() {
+    var out = []
+    for (var i = 0; i < root.shown.length; i++)
+      if (root.selection[root.shown[i].key] === true) out.push(root.shown[i])
+    return out
+  }
+  // Элементы для действий: сначала выделение, иначе курсор/открытый кадр.
+  function actionItems() {
+    var s = root.selectedItems()
+    if (s.length > 0) return s
+    var one = root.actionItem()
+    return one ? [one] : []
+  }
+
+  // Сохранить оригиналы без перекодирования. askDir=true — диалог выбора папки.
+  function saveItems(items, askDir) {
+    if (!items || items.length === 0) { root.showNotice("Нечего сохранять"); return }
     if (askDir) {
-      root.enqueueJob("pick-dir", [root.home + "/Pictures"], { item: item })
+      root.enqueueJob("pick-dir", [root.home + "/Pictures"], { items: items })
     } else {
       var dir = Model.defaultExportDir(root.home)
-      root.enqueueJob("names", [dir], { item: item, dir: dir })
+      root.enqueueJob("names", [dir], { items: items, dir: dir })
     }
   }
 
-  // Фото — в буфер картинкой, видео и прочее — текстовым путём.
-  function copyItem(item) {
-    if (!item) { root.showNotice("Нечего копировать"); return }
-    if (item.kind === "photo") root.enqueueJob("clip-image", [item.path], { item: item })
-    else root.enqueueJob("clip-text", [item.path], { item: item })
+  // Один элемент: фото — картинкой, прочее — путём. Пачка — список путей текстом.
+  function copyItems(items) {
+    if (!items || items.length === 0) { root.showNotice("Нечего копировать"); return }
+    if (items.length === 1) {
+      if (items[0].kind === "photo") root.enqueueJob("clip-image", [items[0].path], { item: items[0] })
+      else root.enqueueJob("clip-text", [items[0].path], { item: items[0] })
+      return
+    }
+    var paths = []
+    for (var i = 0; i < items.length; i++) paths.push(items[i].path)
+    root.enqueueJob("clip-text", [paths.join("\n")], { items: items })
   }
 
   Process {
@@ -624,6 +685,7 @@ Panel {
 
       onCloseRequested: {
         if (root.viewerIndex >= 0) root.closeViewer()
+        else if (root.selectionCount > 0) root.clearSelection()
         else root.close()
       }
       onActivateRequested: root.activateCursor()
@@ -640,17 +702,27 @@ Panel {
       Shortcut {
         sequence: "Ctrl+S"
         enabled: root.opened && !filterField.activeFocus
-        onActivated: root.saveItem(root.actionItem(), false)
+        onActivated: root.saveItems(root.actionItems(), false)
       }
       Shortcut {
         sequence: "Ctrl+Shift+S"
         enabled: root.opened && !filterField.activeFocus
-        onActivated: root.saveItem(root.actionItem(), true)
+        onActivated: root.saveItems(root.actionItems(), true)
       }
       Shortcut {
         sequence: "Ctrl+C"
         enabled: root.opened && !filterField.activeFocus
-        onActivated: root.copyItem(root.actionItem())
+        onActivated: root.copyItems(root.actionItems())
+      }
+      Shortcut {
+        sequence: "Space"
+        enabled: root.opened && root.viewerIndex < 0 && !filterField.activeFocus
+        onActivated: root.toggleSelect(root.actionItem())
+      }
+      Shortcut {
+        sequence: "Ctrl+A"
+        enabled: root.opened && root.viewerIndex < 0 && !filterField.activeFocus
+        onActivated: root.selectAll()
       }
 
       // ================= сетка =================
@@ -858,7 +930,7 @@ Panel {
               spacing: Style.space(8)
 
               ExportActions {
-                item: root.actionItem()
+                items: root.actionItems()
                 enabled: !root.busy
               }
               Text {
@@ -866,7 +938,9 @@ Panel {
                 Layout.fillWidth: true
                 elide: Text.ElideRight
                 horizontalAlignment: Text.AlignRight
-                text: "Ctrl+S сохранить · Ctrl+Shift+S как · Ctrl+C буфер"
+                text: root.selectionCount > 0
+                  ? ("Выбрано: " + root.selectionCount + " · Space снять · Ctrl+A всё")
+                  : "Space выбрать · Ctrl+A всё · Ctrl+S сохранить · Ctrl+C буфер"
                 color: root.dim
                 font.family: root.fam
                 font.pixelSize: Style.font.caption
@@ -999,7 +1073,7 @@ Panel {
             onClicked: root.toggleVideo()
           }
           ExportActions {
-            item: root.currentItem()
+            items: root.currentItem() ? [root.currentItem()] : []
             enabled: !root.busy
           }
           Button {
@@ -1069,6 +1143,7 @@ Panel {
     required property int index
 
     readonly property bool isVideo: !!modelData && modelData.kind === "video"
+    readonly property bool selected: !!modelData && root.selection[modelData.key] === true
 
     width: grid.cellWidth
     height: grid.cellHeight
@@ -1125,13 +1200,61 @@ Panel {
       }
     }
 
+    // рамка выбранной ячейки
+    Rectangle {
+      anchors.fill: parent
+      anchors.margins: Style.space(2)
+      radius: Style.cornerRadius
+      color: "transparent"
+      border.width: Style.space(2)
+      border.color: root.accentC
+      visible: cell.selected
+      z: 4
+    }
+
     HoverHandler { id: cellHover }
 
     MouseArea {
       anchors.fill: parent
       acceptedButtons: Qt.LeftButton
       cursorShape: Qt.PointingHandCursor
-      onClicked: root.openViewer(cell.index)
+      onClicked: function(mouse) {
+        if (mouse.modifiers & Qt.ControlModifier) root.toggleSelect(cell.modelData)
+        else root.openViewer(cell.index)
+      }
+    }
+
+    // галочка выбора (клик по ней не открывает кадр)
+    Rectangle {
+      id: selectBadge
+      anchors.top: parent.top
+      anchors.left: parent.left
+      anchors.margins: Style.space(5)
+      width: Style.space(18)
+      height: Style.space(18)
+      radius: Style.space(4)
+      color: cell.selected ? root.accentC : Util.alpha(Color.background, 0.6)
+      border.width: Style.space(1)
+      border.color: Util.alpha(root.fg, 0.55)
+      visible: cellHover.hovered || cell.selected
+      z: 6
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: cell.selected ? "\uf00c" : ""
+        color: Color.background
+        font.family: root.fam
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: function(mouse) {
+          root.toggleSelect(cell.modelData)
+          mouse.accepted = true
+        }
+      }
     }
 
     Component.onCompleted: root.requestThumb(cell.modelData)
@@ -1141,41 +1264,56 @@ Panel {
   // ---------- кнопки экспорта ----------
   component ExportActions: RowLayout {
     id: exportRow
-    property var item: null
+    property var items: []
+    readonly property bool canAct: items.length > 0 && exportRow.enabled
+    readonly property string saveLabel: root.selectionCount > 0
+      ? ("Сохранить (" + root.selectionCount + ")") : "Сохранить"
     spacing: Style.space(6)
 
     Button {
-      text: "Сохранить"
-      enabled: !!exportRow.item && exportRow.enabled
+      text: exportRow.saveLabel
+      enabled: exportRow.canAct
       foreground: root.fg
       fontFamily: root.fam
       fontSize: Style.font.caption
       horizontalPadding: Style.space(8)
       verticalPadding: Style.space(4)
       focusable: false
-      onClicked: root.saveItem(exportRow.item, false)
+      onClicked: root.saveItems(exportRow.items, false)
     }
     Button {
       text: "Сохранить как"
-      enabled: !!exportRow.item && exportRow.enabled
+      enabled: exportRow.canAct
       foreground: root.fg
       fontFamily: root.fam
       fontSize: Style.font.caption
       horizontalPadding: Style.space(8)
       verticalPadding: Style.space(4)
       focusable: false
-      onClicked: root.saveItem(exportRow.item, true)
+      onClicked: root.saveItems(exportRow.items, true)
     }
     Button {
       text: "В буфер"
-      enabled: !!exportRow.item && exportRow.enabled
+      enabled: exportRow.canAct
       foreground: root.fg
       fontFamily: root.fam
       fontSize: Style.font.caption
       horizontalPadding: Style.space(8)
       verticalPadding: Style.space(4)
       focusable: false
-      onClicked: root.copyItem(exportRow.item)
+      onClicked: root.copyItems(exportRow.items)
+    }
+    Button {
+      text: root.selectionCount > 0 ? "Снять выбор" : "Выбрать всё"
+      enabled: exportRow.enabled && (root.selectionCount > 0 || root.shown.length > 0)
+      visible: root.viewerIndex < 0
+      foreground: root.fg
+      fontFamily: root.fam
+      fontSize: Style.font.caption
+      horizontalPadding: Style.space(8)
+      verticalPadding: Style.space(4)
+      focusable: false
+      onClicked: root.selectionCount > 0 ? root.clearSelection() : root.selectAll()
     }
   }
 

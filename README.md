@@ -26,6 +26,8 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
   (`Ctrl+S`) or pick a folder (`Ctrl+Shift+S`); existing names get a ` (1)`, ` (2)`
   suffix instead of being overwritten. `Ctrl+C` puts a photo in the clipboard as
   `image/png` (HEIC is decoded with `heif-convert`), or a video's path as text.
+- **Batch selection**: `Space`, the checkbox, or `Ctrl`+click selects cells,
+  `Ctrl+A` selects all visible; the export buttons then act on the whole selection.
 - **Clear states** instead of a blank screen: phone not connected, not trusted,
   `gvfs-afc` missing, no `DCIM`, mounting in progress.
 
@@ -114,9 +116,12 @@ Uninstall with `./install.sh --uninstall`.
 | Sort | the “newest / oldest first” button |
 | Previous / next in viewer | `← →` or the side buttons |
 | Video play / pause | `p`, `Space`, or the button |
+| Select / deselect a cell | `Space`, the checkbox, or `Ctrl`+click |
+| Select all visible | `Ctrl+A` |
 | Save to `~/Pictures/iPhone` | `Ctrl+S` or the “Сохранить” button |
 | Save as (pick a folder) | `Ctrl+Shift+S` or the “Сохранить как” button |
 | Copy to clipboard | `Ctrl+C` — photo as image, video as path |
+| Clear selection | `Esc` or the “Снять выбор” button |
 | Back to grid | `Esc` |
 | Close popup | `Esc` (from the grid) |
 

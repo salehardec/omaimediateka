@@ -251,6 +251,29 @@ function destPath(dir, name) {
   return d + "/" + name
 }
 
+// Русское склонение слова «файл»: 1 файл, 2-4 файла, 5+ файлов.
+function fileWord(n) {
+  var v = Math.abs(Number(n) || 0)
+  var n10 = v % 10, n100 = v % 100
+  if (n10 === 1 && n100 !== 11) return "файл"
+  if (n10 >= 2 && n10 <= 4 && (n100 < 10 || n100 >= 20)) return "файла"
+  return "файлов"
+}
+
+// Уникальные имена для пачки: учитывает и уже лежащее в каталоге (`taken`),
+// и коллизии внутри самой пачки. Возвращает массив в порядке входа.
+function allocateNames(names, taken) {
+  var used = {}
+  for (var k in (taken || {})) used[k] = true
+  var out = []
+  for (var i = 0; i < (names || []).length; i++) {
+    var n = uniqueName(names[i], used)
+    used[n] = true
+    out.push(n)
+  }
+  return out
+}
+
 function findIndexByKey(items, key) {
   for (var i = 0; i < (items || []).length; i++) if (items[i].key === key) return i
   return -1
@@ -274,6 +297,8 @@ if (typeof module !== "undefined" && module.exports) {
     splitExt: splitExt,
     uniqueName: uniqueName,
     destPath: destPath,
+    allocateNames: allocateNames,
+    fileWord: fileWord,
     hashKey: hashKey,
     numericKey: numericKey,
     folderKey: folderKey,
