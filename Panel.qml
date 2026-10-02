@@ -367,6 +367,9 @@ Panel {
     root.viewerIndex = index
     root.cursor = index
     root.videoActive = false
+    // Уводим фокус из строки фильтра: иначе открытие кадра по Enter оставляет
+    // фокус в поле, и горячие клавиши экспорта в просмотрщике отключены.
+    keyCatcher.forceActiveFocus()
     root.updatePreview()
   }
   function closeViewer() {
