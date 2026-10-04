@@ -384,15 +384,39 @@ QML импортирует `Connections`-подобный `MediaModel.js` (`impo
 
 **Английские caption'ы.** `MediaAnalysis/MediaAnalysis.sqlite`:
 `ZIMAGECAPTIONRESULT` / `ZVIDEOCAPTIONRESULT` (`ZCAPTION`);
-`ZASSET.ZLOCALIDENTIFIER[:36]` = `Photos.ZASSET.ZUUID`.
+`ZASSET.ZLOCALIDENTIFIER[:36]` = `Photos.ZASSET.ZUUID`. Дополнительно берём
+`ZVIDEOSEGMENTCAPTIONRESULT.ZCAPTION` — посегментные caption'ы видео (на этой
+библиотеке 439 ассетов против 1175 с общим caption'ом, суммарно ~9.5 тыс.
+описаний); они дают слова, которых в общих caption'ах нет («sunglasses»,
+«fishing rod», «life jacket»).
+
+**Метки MediaAnalysis.** Та же база хранит не только caption'ы:
+`ZCLASSIFICATIONRESULT` (`ZSCENEID` по кадрам + `ZCONFIDENCE`),
+`ZHUMANACTIONCLASSIFICATIONRESULT` (`ZACTIONSCONFIDENCE` — NSKeyedArchiver-блоб
+`{"<id>": conf}`) и `ZPETSRESULT`. Числовые id переводятся в русские метки по
+таксономии `Photos.ZLEOLEXEME.ZIDENTIFIER` (`scene/NNN`, `humanAction/NNN`).
+Метки сцен попадают в источник `scene`, действия человека — в `action`,
+питомцы — в `pet`. Ниже порога уверенности метка не индексируется
+(сцена 0.3, действие 0.3, питомец 0.7): на видеокадрах иначе проскакивает шум.
+Имена людей (категория `3000`) по-прежнему локальны и нигде не логируются.
+Таблицы без полезного сигнала пропущены: `ZSCENERESULT`/`ZRESULT` —
+эмбеддинги, `ZSAFETYRESULT.ZSENSITIVITY` — чувствительный контент,
+`ZANIMALRESULT` (15 строк) — таксономия вида недоступна, `ZVOICERESULT`/
+`ZMUSICRESULT` дублируют аудио-лексемы Leo.
 
 **Кэш.** Хелпер получил подкоманды `index` и `search`:
 - `index` копирует `Photos.sqlite` и `MediaAnalysis.sqlite` с `-wal`/`-shm`
   в `~/.cache/omaimediateka/apple-index/`, делает на копиях
   `wal_checkpoint(TRUNCATE)` и собирает компактный
   `~/.cache/omaimediateka/search.sqlite`:
-  `asset(uuid, path, kind)`, `token(asset_uuid, lexeme, norm, category, source)`,
+  `asset(uuid, path, kind)`,
+  `token(asset_uuid, lexeme, norm, category, source, provider)`,
   `caption(asset_uuid, text, lang)`, `meta(key, value)`.
+  `provider` (`leo`/`ma`) различает лексемы родного индекса и метки
+  MediaAnalysis: последние пересобираются целиком при каждом прогоне, лексемы
+  Leo — инкрементально. Формат кэша — версия 2; кэш версии 1 мигрирует
+  (`ALTER TABLE token ADD COLUMN provider`) и пересобирается из уже лежащих
+  копий без повторной закачки.
   Путь хранится относительно точки монтирования. Индекс **инкрементальный**:
   если `-wal`/`-shm` (размер+mtime) не изменились и UDID тот же — копирование
   и пересборка не запускаются (≈45 мс); изменились — перекачиваются базы, а
@@ -401,7 +425,7 @@ QML импортирует `Connections`-подобный `MediaModel.js` (`impo
   Разбор BLOB — на `python3` (`bin/oma-mediateka-index.py`), на телефоне
   ничего не меняется.
 - `search <query>` печатает TSV `path<TAB>source<TAB>matched`, где source ∈
-  `name|scene|activity|ocr|library|place|people|caption`. Поиск
+  `name|scene|action|activity|ocr|library|place|people|pet|caption`. Поиск
   регистронезависимый, с `ё→е` и грубым отсечением русских окончаний; матч —
   префиксный по нормализованным лексемам и по словам caption'ов, все токены
   запроса должны найтись (AND). Пустой или однобуквенный запрос ничего не
@@ -410,8 +434,10 @@ QML импортирует `Connections`-подобный `MediaModel.js` (`impo
 **UI.** Строка фильтра ищет по имени, папке и индексу. Пока индекс не готов,
 поиск идёт только по имени/папке и никого не ждёт; индекс докачивается в фоне
 после подключения телефона (кнопка «Обновить поиск» — вручную) с прогрессом
-«Индексирую: N/M». У совпавших ячеек — бейдж источника («сцена», «текст»,
-«caption», …), в шапке просмотрщика — та же метка. `MediaModel` зеркалит
+«Индексирую: N/M». У совпавших ячеек — бейдж источника («сцена»,
+«действие», «текст», «caption», «питомец», …), в шапке просмотрщика — та же
+метка и до четырёх совпавших терминов (`MediaModel.matchedTerms`). `MediaModel`
+зеркалит
 нормализацию запроса, объединяет совпадения по имени и по индексу, схлопывает
 пары Live Photo HEIC+MOV (оставляя фото) и ранжирует по числу содержательных
 источников. Ассеты без локального файла в `DCIM` (только в iCloud) в выдачу не
@@ -419,3 +445,7 @@ QML импортирует `Connections`-подобный `MediaModel.js` (`impo
 
 **Производительность** (библиотека 3522 ассета): первая индексация с
 копированием ~15 с, повторная проверка ~45 мс, поиск ~80 мс.
+
+**Покрытие меток MediaAnalysis** (на этой библиотеке): сцены по кадрам —
+97 видео (обогащают уже найденные сцены Leo), действия человека — до 45
+ассетов, питомцы — 10, посегментные caption'ы — 439 видео.

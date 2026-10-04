@@ -1202,6 +1202,8 @@ Panel {
               if (it.kind === "video" && root.videoMeta && root.videoMeta.duration > 0)
                 parts.push(Model.formatDuration(root.videoMeta.duration))
               if (Model.badgeLabel(it) !== "") parts.push(Model.badgeLabel(it))
+              var terms = Model.matchedTerms(it, 4)
+              if (terms.length > 0) parts.push("метки: " + terms.join(", "))
               return parts.join("  ·  ")
             }
             color: root.fg
