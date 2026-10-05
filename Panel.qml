@@ -277,8 +277,13 @@ Panel {
         root.indexStatus = ""
         if (!wasReady) root.showNotice("Поиск по содержимому готов")
         root.runSearch()
+      } else if (code === 3) {
+        // Лок занят: индекс уже собирает другой процесс — это не ошибка.
+        root.indexError = ""
+        root.indexStatus = "Индексация уже идёт"
       } else {
-        root.indexReady = false
+        // Старый кэш (если он был) остаётся рабочим: поиск не гасим, только
+        // показываем понятную причину в строке статуса.
         if (root.indexError === "")
           root.indexError = code === 4 ? "Нужен python3" : "Индекс Apple недоступен"
       }
@@ -1202,6 +1207,8 @@ Panel {
               if (it.kind === "video" && root.videoMeta && root.videoMeta.duration > 0)
                 parts.push(Model.formatDuration(root.videoMeta.duration))
               if (Model.badgeLabel(it) !== "") parts.push(Model.badgeLabel(it))
+              var terms = Model.matchedTerms(it, 4)
+              if (terms.length > 0) parts.push("метки: " + terms.join(", "))
               return parts.join("  ·  ")
             }
             color: root.fg

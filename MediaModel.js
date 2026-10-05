@@ -154,15 +154,17 @@ function filterItems(items, query) {
 // пары Live Photo и ранжирует: чем больше содержательных источников совпало,
 // тем выше элемент.
 
-var SOURCE_ORDER = ["name", "scene", "activity", "ocr", "library", "place", "people", "caption"]
+var SOURCE_ORDER = ["name", "scene", "action", "activity", "ocr", "library", "place", "people", "pet", "caption"]
 var SOURCE_LABELS = {
   name: "имя",
   scene: "сцена",
+  action: "действие",
   activity: "событие",
   ocr: "текст",
   library: "метка",
   place: "место",
   people: "люди",
+  pet: "питомец",
   caption: "caption"
 }
 
@@ -265,6 +267,25 @@ function badgeLabel(item) {
   var s = labels.join(" · ")
   if (cs.length > 2) s += " +" + (cs.length - 2)
   return s
+}
+
+// Уникальные совпавшие термины из индекса (без имени файла), максимум limit.
+// Нужны, чтобы в просмотрщике было видно, чем именно ассет зацепился за запрос
+// (например, меткой действия из MediaAnalysis).
+function matchedTerms(item, limit) {
+  var out = []
+  var matched = (item && item.matched) || {}
+  var sources = sortSources(Object.keys(matched))
+  for (var i = 0; i < sources.length; i++) {
+    if (sources[i] === "name") continue
+    var list = matched[sources[i]] || []
+    for (var j = 0; j < list.length; j++) {
+      var t = String(list[j])
+      if (t !== "" && out.indexOf(t) === -1) out.push(t)
+    }
+  }
+  var n = (limit === undefined || limit <= 0) ? 5 : limit
+  return out.slice(0, n)
 }
 
 function baseNameOf(name) {
@@ -503,6 +524,7 @@ if (typeof module !== "undefined" && module.exports) {
     searchScore: searchScore,
     contentSources: contentSources,
     badgeLabel: badgeLabel,
+    matchedTerms: matchedTerms,
     sourceLabel: sourceLabel,
     sortSources: sortSources,
     baseNameOf: baseNameOf,

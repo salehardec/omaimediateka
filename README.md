@@ -22,8 +22,9 @@ and a fullscreen viewer. Access is local and read-only: the phone is mounted by
 - **Fullscreen viewer** — photos fit the screen; videos play inline through
   QtMultimedia. `←/→` navigates, metadata (name, date, size, duration) is shown.
 - **Live filter** by file name or folder, plus **content search** over Apple's
-  on-device index (localized scene/OCR tokens and English captions) with a
-  per-cell source badge, and newest-/oldest-first sorting.
+  on-device index (localized scene/OCR tokens, scene and action labels from
+  `MediaAnalysis`, and English captions, including per-segment video captions)
+  with a per-cell source badge, and newest-/oldest-first sorting.
 - **Export** (read-only on the phone): save the original to `~/Pictures/iPhone`
   (`Ctrl+S`) or pick a folder (`Ctrl+Shift+S`); existing names get a ` (1)`, ` (2)`
   suffix instead of being overwritten. `Ctrl+C` puts a photo in the clipboard as
@@ -151,14 +152,15 @@ Uninstall with `./install.sh --uninstall`.
 - **Cache** — `~/.cache/omaimediateka/thumbs/` and `.../previews/`. Keys include the
   file size and mtime, so changed files are re-rendered and unchanged ones are reused.
 - **Content search** — the helper copies `Photos.sqlite` and `MediaAnalysis.sqlite`
-  into `~/.cache/omaimediateka/apple-index/` and turns Apple's Leo lexeme index and
-  Vision captions into a compact `search.sqlite` (`asset`, `token`, `caption`). The
-  BLOB parsing runs in `bin/oma-mediateka-index.py`. The index is refreshed
-  incrementally when the phone is reconnected (or on demand), so browsing never
-  waits for it. Russian tokens are stemmed and matched by prefix, English captions
-  by word prefix, and name/folder matches are merged in. Search results collapse a
-  Live Photo's HEIC+MOV into the photo and rank elements by how many content
-  sources matched.
+  into `~/.cache/omaimediateka/apple-index/` and turns Apple's Leo lexeme index,
+  `MediaAnalysis` scene/action/pet labels and Vision captions (whole-asset and
+  per-segment video captions) into a compact `search.sqlite` (`asset`, `token`,
+  `caption`). BLOB and NSKeyedArchiver parsing runs in `bin/oma-mediateka-index.py`.
+  The index is refreshed incrementally when the phone is reconnected (or on
+  demand), so browsing never waits for it. Russian tokens are stemmed and matched
+  by prefix, English captions by word prefix, and name/folder matches are merged
+  in. Search results collapse a Live Photo's HEIC+MOV into the photo and rank
+  elements by how many content sources matched; low-confidence labels are dropped.
 - **Sorting** — by Apple’s file numbering (folder + number), which is chronological
   even when gvfs `mtime` is unreliable, with mtime as a tie-breaker.
 
@@ -177,7 +179,10 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 - **Content search** reuses an undocumented Apple index: ~99.5 % of assets are
   covered, assets stored only in iCloud are skipped (no local file), and an iOS
   update may change the schema — in which case search degrades gracefully to
-  name/folder filtering.
+  name/folder filtering. If the iPhone gets locked or is on a call mid-index, the
+  copy is retried three times and the status line then shows “Нет доступа к
+  телефону: разблокируйте iPhone, завершите звонок и повторите”; the previous
+  index keeps working.
 - The content index is built per device in `~/.cache/omaimediateka/` and refreshed
   when the phone reconnects; the first build copies ~330 MB over USB (~15 s).
 - One iPhone at a time; the first detected device wins.
@@ -188,6 +193,7 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 
 ```bash
 node test/MediaModel.test.js        # pure model: listing, sorting, filtering, search merge
+python3 test/test_index.py          # cache build: BLOBs, actions, thresholds, migration
 bash -n bin/oma-mediateka           # helper syntax
 python3 -m py_compile bin/oma-mediateka-index.py   # indexer syntax
 ./bin/oma-mediateka status          # with no phone: state=no-device

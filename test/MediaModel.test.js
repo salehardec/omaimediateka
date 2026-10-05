@@ -312,4 +312,66 @@ test("contentSources / sourceLabel / badgeLabel: до двух меток и +N"
   assert.strictEqual(M.badgeLabel({ sources: ["name"] }), "")
 })
 
+// --- метки MediaAnalysis (действия, сцены по кадрам, питомцы) ---------------
+
+test("sourceLabel / sortSources: новые источники action и pet", () => {
+  assert.strictEqual(M.sourceLabel("action"), "действие")
+  assert.strictEqual(M.sourceLabel("pet"), "питомец")
+  assert.deepStrictEqual(M.sortSources(["caption", "pet", "name", "action", "scene"]), [
+    "name", "scene", "action", "pet", "caption"
+  ])
+})
+
+test("badgeLabel: действие и питомец попадают в бейдж", () => {
+  assert.strictEqual(M.badgeLabel({ sources: ["action"] }), "действие")
+  assert.strictEqual(M.badgeLabel({ sources: ["scene", "action"] }), "сцена · действие")
+  assert.strictEqual(M.badgeLabel({ sources: ["action", "pet", "caption"] }), "действие · питомец +1")
+})
+
+test("matchedTerms: уникальные термины без имени, с лимитом", () => {
+  const it = {
+    sources: ["name", "scene", "action", "caption"],
+    matched: {
+      name: ["IMG_0001"],
+      scene: ["Снег", "Снег", "Зима"],
+      action: ["Прогулка"],
+      caption: ["a walk in the snow"]
+    }
+  }
+  assert.deepStrictEqual(M.matchedTerms(it, 3), ["Снег", "Зима", "Прогулка"])
+  assert.deepStrictEqual(M.matchedTerms(it), ["Снег", "Зима", "Прогулка", "a walk in the snow"])
+  assert.deepStrictEqual(M.matchedTerms({}), [])
+  assert.deepStrictEqual(M.matchedTerms({ matched: { name: ["x"] } }), [])
+})
+
+test("mergeSearch: метки action/pet из MediaAnalysis дают бейдж и ранг", () => {
+  const actionRows = M.parseSearchRows([
+    pathOf("IMG_0200.JPG") + "\taction\tПрогулка"
+  ].join("\n"))
+  const res = M.mergeSearch(SEARCH_ITEMS, actionRows, "прогулка")
+  assert.strictEqual(res.length, 1)
+  assert.deepStrictEqual(res[0].sources, ["action"])
+  assert.strictEqual(M.badgeLabel(res[0]), "действие")
+  // «Питомец» и «Снег» — два содержательных источника, выше одиночного action
+  const petRows = M.parseSearchRows([
+    pathOf("IMG_0300.HEIC") + "\tpet\tПитомец",
+    pathOf("IMG_0300.HEIC") + "\tscene\tСнег"
+  ].join("\n"))
+  const pet = M.mergeSearch(SEARCH_ITEMS, petRows, "снег")
+  assert.deepStrictEqual(pet.map((i) => i.name), ["IMG_0300.HEIC"])
+  assert.deepStrictEqual(pet[0].sources, ["scene", "pet"])
+  assert.strictEqual(M.searchScore(pet[0]) > M.searchScore(res[0]), true)
+})
+
+test("mergeSearch: сцена из MediaAnalysis не дублирует уже найденную", () => {
+  const rows = M.parseSearchRows([
+    pathOf("IMG_0200.JPG") + "\tscene\tМоре",
+    pathOf("IMG_0200.JPG") + "\tscene\tВолна"
+  ].join("\n"))
+  const res = M.mergeSearch(SEARCH_ITEMS, rows, "море")
+  assert.strictEqual(res.length, 1)
+  assert.deepStrictEqual(res[0].sources, ["scene"])
+  assert.deepStrictEqual(res[0].matched.scene, ["Море", "Волна"])
+})
+
 console.log("\n" + passed + " passed")

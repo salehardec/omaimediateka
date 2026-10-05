@@ -22,11 +22,13 @@
 # недоступна, остальные подкоманды хелпера работают как раньше.
 
 import os
+import plistlib
 import re
 import shutil
 import sqlite3
 import struct
 import sys
+import time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS asset(
@@ -39,7 +41,8 @@ CREATE TABLE IF NOT EXISTS token(
   lexeme TEXT NOT NULL,
   norm TEXT NOT NULL,
   category INTEGER NOT NULL,
-  source TEXT NOT NULL
+  source TEXT NOT NULL,
+  provider TEXT
 );
 CREATE TABLE IF NOT EXISTS caption(
   asset_uuid TEXT NOT NULL,
@@ -57,10 +60,31 @@ VIDEO_EXTS = {"mp4", "mov", "m4v"}
 
 # Версия формата компактного кэша; при смене логики нормализации/схемы
 # инкрементальный кэш пересобирается с нуля.
-INDEX_VERSION = "1"
+INDEX_VERSION = "2"
+
+# Коды возврата `index` (их разбирает Panel.qml).
+INDEX_EXIT_OK = 0
+INDEX_EXIT_NO_DEVICE = 1
+INDEX_EXIT_IO = 2
+INDEX_EXIT_LOCKED = 3
+INDEX_EXIT_NO_PYTHON = 4
+
+# Чтение через AFC может падать с EIO (телефон заблокирован, гонка, обрыв):
+# копируем через временный файл, повторяем и подменяем цели атомарно.
+COPY_ATTEMPTS = 3
+LOCK_TIMEOUT_S = 300.0
 
 # Порядок источников в выдаче (чем раньше, тем выше в бейдже).
-SOURCE_ORDER = ["name", "scene", "activity", "ocr", "library", "place", "people", "caption"]
+SOURCE_ORDER = [
+    "name", "scene", "action", "activity", "ocr", "library", "place",
+    "people", "pet", "caption",
+]
+
+# Минимальные уверенности MediaAnalysis: ниже порога метка не попадает в
+# индекс, иначе на видеокадрах проскакивает шум (например «Егра» на 0.56).
+SCENE_MIN_CONF = 0.3
+ACTION_MIN_CONF = 0.3
+PET_MIN_CONF = 0.7
 
 # Общие русские словоизменительные окончания. Список отсортирован от длинных
 # к коротким; отсекается не больше одного, стем короче 3 символов не трогаем.
@@ -76,6 +100,8 @@ CYRILLIC = re.compile(r"[а-я]")
 
 def cat_source(cat):
     """Категория лексемы ZLEOLEXEME.ZCATEGORY -> источник для выдачи."""
+    if cat == 4060:
+        return "action"  # humanAction/NNN: «Прогулка», «Танец», «Бег»
     if cat == 4090:
         return "activity"
     if cat == 4120:
@@ -144,25 +170,178 @@ def open_ro(path):
     return sqlite3.connect("file:%s?mode=ro" % path, uri=True)
 
 
-def copy_db(src, dst_dir, name):
-    """Копирует базу и её -wal/-shm в кэш, схлопывает WAL на копии."""
-    made = False
+def parse_action_confidences(blob):
+    """Разбор ZACTIONSCONFIDENCE (NSKeyedArchiver) -> {humanAction id: conf}.
+
+    Значение — plist с NSDictionary вида {"<id>": <confidence>}. Ошибки разбора
+    не критичны: при неизвестном формате просто не добавляем действия.
+    """
+    try:
+        obj = plistlib.loads(blob)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    objects = obj.get("$objects")
+    top = obj.get("$top")
+    if not isinstance(objects, list) or not isinstance(top, dict):
+        return {}
+    try:
+        root = objects[top["root"]]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    if not isinstance(root, dict):
+        return {}
+    keys = root.get("NS.keys") or []
+    values = root.get("NS.objects") or []
+    out = {}
+    for ref_key, ref_val in zip(keys, values):
+        try:
+            action_id = str(objects[ref_key])
+            confidence = objects[ref_val]
+        except (IndexError, TypeError):
+            continue
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            out[action_id] = float(confidence)
+    return out
+
+
+def load_taxonomy(con_photos):
+    """id-таксономия Photos -> русские метки для MediaAnalysis.
+
+    MediaAnalysis хранит только числовые id (`ZSCENEID`, ключ humanAction),
+    а их локализованные названия лежат в `ZLEOLEXEME.ZIDENTIFIER` вида
+    `scene/NNN` / `humanAction/NNN`.
+    """
+    taxonomy = {}
+    for ident, content in con_photos.execute(
+            "SELECT ZIDENTIFIER, ZCONTENT FROM ZLEOLEXEME "
+            "WHERE ZIDENTIFIER LIKE 'scene/%' OR ZIDENTIFIER LIKE 'humanAction/%'"):
+        text = (content or "").strip()
+        if text:
+            taxonomy.setdefault(ident, set()).add(text)
+    return taxonomy
+
+
+def fingerprint_size(fp):
+    """Размер базового файла из строки fingerprint (-1, если не распознан)."""
+    try:
+        return int(fp.split("|", 1)[0].split(":")[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def copy_truncated(copy_path, fp):
+    """Похоже ли, что локальная копия оборвана (старый EIO без .tmp)?"""
+    want = fingerprint_size(fp)
+    if want < 0:
+        return False
+    try:
+        return os.path.getsize(copy_path) != want
+    except OSError:
+        return True
+
+
+def _copy_file_once(src, tmp):
+    """Одно копирование src -> tmp блоками (без подмены цели)."""
+    with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+        shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+        fdst.flush()
+        os.fsync(fdst.fileno())
+
+
+def copy_db(src, dst_dir, name, attempts=COPY_ATTEMPTS):
+    """Копирует базу и её -wal/-shm в кэш, схлопывает WAL на копии.
+
+    Чтение через AFC может падать с ``OSError: [Errno 5] Input/output error``
+    (телефон заблокирован, гонка за AFC, обрыв mount). Поэтому каждая часть
+    пишется во временный файл, при ошибке попытка повторяется (до `attempts`
+    раз с нарастающей паузой), а цели подменяются только когда скопировались
+    все части. При ошибке старые рабочие копии остаются нетронутыми, и поиск
+    продолжает работать на прежнем кэше.
+    """
+    dst_base = os.path.join(dst_dir, name)
+    os.makedirs(dst_dir, exist_ok=True)
+    parts = []
     for suf in ("", "-wal", "-shm"):
         s = src + suf
-        d = os.path.join(dst_dir, name) + suf
-        if os.path.exists(s):
-            shutil.copyfile(s, d)
-            made = True
-        elif os.path.exists(d):
-            os.remove(d)
-    if made:
         try:
-            con = sqlite3.connect(os.path.join(dst_dir, name))
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            con.close()
-        except sqlite3.Error:
-            pass
-    return made
+            exists = os.path.exists(s)
+        except OSError:
+            exists = False
+        if exists:
+            parts.append((s, dst_base + suf))
+    if not parts:
+        return False
+
+    for attempt in range(attempts):
+        staged = []
+        try:
+            for s, d in parts:
+                tmp = d + ".tmp"
+                _copy_file_once(s, tmp)
+                staged.append((tmp, d))
+            for tmp, d in staged:
+                os.replace(tmp, d)
+            keep = {d for _, d in parts}
+            for suf in ("", "-wal", "-shm"):
+                d = dst_base + suf
+                if d not in keep:
+                    try:
+                        os.remove(d)
+                    except OSError:
+                        pass
+            break
+        except OSError:
+            for _, d in parts:
+                try:
+                    os.remove(d + ".tmp")
+                except OSError:
+                    pass
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.6 * (attempt + 1))
+
+    try:
+        con = sqlite3.connect(dst_base)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
+    except sqlite3.Error:
+        pass
+    return True
+
+
+def _lock_timeout():
+    try:
+        return float(os.environ.get("OMA_INDEX_LOCK_TIMEOUT", LOCK_TIMEOUT_S))
+    except ValueError:
+        return LOCK_TIMEOUT_S
+
+
+def _acquire_lock(cache_dir, timeout=None):
+    """Файловый лок: два `index` не должны качать базы одновременно.
+
+    Возвращает открытый файл (его надо держать открытым до конца работы) или
+    None, если лок занят дольше timeout. На не-Linux fcntl нет — тогда
+    работаем без лока, а не падаем.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return open(os.devnull, "w")
+    path = os.path.join(cache_dir, ".index.lock")
+    os.makedirs(cache_dir, exist_ok=True)
+    fd = open(path, "w")
+    deadline = time.monotonic() + (_lock_timeout() if timeout is None else timeout)
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                return None
+            time.sleep(0.5)
 
 
 def get_meta(con, key):
@@ -175,14 +354,51 @@ def set_meta(con, key, value):
 
 
 def cmd_index(mount, cache_dir, db_path, udid):
+    """Обёртка: лок от параллельного запуска и понятная ошибка AFC."""
+    photos_src = os.path.join(mount, "PhotoData", "Photos.sqlite")
+    try:
+        has_photos = os.path.exists(photos_src)
+    except OSError:
+        has_photos = False
+    if not has_photos:
+        sys.stderr.write("нет %s — iPhone не смонтирован или нет доступа\n" % photos_src)
+        return INDEX_EXIT_NO_DEVICE
+    os.makedirs(cache_dir, exist_ok=True)
+    lock = _acquire_lock(cache_dir)
+    if lock is None:
+        sys.stderr.write("Индексация уже выполняется другим процессом — подождите\n")
+        return INDEX_EXIT_LOCKED
+    try:
+        return _do_index(mount, cache_dir, db_path, udid)
+    except OSError as e:
+        sys.stderr.write(
+            "Нет доступа к телефону: разблокируйте iPhone, завершите звонок "
+            "и повторите (%s)\n"
+            % (getattr(e, "strerror", None) or e))
+        return INDEX_EXIT_IO
+    except sqlite3.DatabaseError:
+        # Локальная копия побита (например, след старого оборванного EIO) —
+        # сносим её, чтобы следующий запуск скачал заново, а не падал.
+        for nm in ("Photos.sqlite", "MediaAnalysis.sqlite"):
+            for suf in ("", "-wal", "-shm"):
+                try:
+                    os.remove(os.path.join(cache_dir, nm + suf))
+                except OSError:
+                    pass
+        sys.stderr.write("Базы Apple повреждены — переподключите iPhone и повторите\n")
+        return INDEX_EXIT_IO
+    finally:
+        try:
+            lock.close()
+        except OSError:
+            pass
+
+
+def _do_index(mount, cache_dir, db_path, udid):
     photos_src = os.path.join(mount, "PhotoData", "Photos.sqlite")
     media_src = os.path.join(mount, "MediaAnalysis", "MediaAnalysis.sqlite")
     photos_copy = os.path.join(cache_dir, "Photos.sqlite")
     media_copy = os.path.join(cache_dir, "MediaAnalysis.sqlite")
-
-    if not os.path.exists(photos_src):
-        sys.stderr.write("нет %s — iPhone не смонтирован или нет доступа\n" % photos_src)
-        return 1
 
     os.makedirs(cache_dir, exist_ok=True)
     reuse = os.environ.get("OMA_INDEX_REUSE") == "1"
@@ -203,10 +419,15 @@ def cmd_index(mount, cache_dir, db_path, udid):
             ver_ok = get_meta(con, "version") == INDEX_VERSION
             has_assets = con.execute("SELECT COUNT(*) FROM asset").fetchone()[0] > 0
             con.close()
-            if fp_ok and ver_ok and has_assets:
+            # Обрыв копирования в старой версии мог оставить усечённый файл:
+            # тогда перекачиваем, даже если отпечатки сошлись.
+            copies_ok = copies_exist and \
+                not copy_truncated(photos_copy, fp_photos) and \
+                (not fp_media or not copy_truncated(media_copy, fp_media))
+            if fp_ok and ver_ok and has_assets and copies_ok:
                 print("Индекс актуален")
                 return 0
-            if fp_ok and copies_exist:
+            if fp_ok and copies_exist and copies_ok:
                 # Базы не менялись, устарела лишь схема/логика кэша —
                 # пересобираем из уже лежащих копий, не перекачивая 350 МБ.
                 need_copy = False
@@ -226,6 +447,10 @@ def cmd_index(mount, cache_dir, db_path, udid):
 
     con = sqlite3.connect(db_path)
     con.executescript(SCHEMA)
+    # Миграция версии 1 -> 2: у token появился provider (leo|ma).
+    token_cols = {r[1] for r in con.execute("PRAGMA table_info(token)")}
+    if "provider" not in token_cols:
+        con.execute("ALTER TABLE token ADD COLUMN provider TEXT")
 
     prev_udid = get_meta(con, "udid")
     prev_version = get_meta(con, "version")
@@ -264,6 +489,9 @@ def cmd_index(mount, cache_dir, db_path, udid):
             continue
         lexemes.setdefault(lid, set()).add((text, cat))
 
+    # --- id-таксономия для MediaAnalysis (scene/NNN, humanAction/NNN) --------
+    taxonomy = load_taxonomy(p)
+
     # --- токены только для новых ассетов (инкрементально) -------------------
     tokens = []
     newset = set(new)
@@ -293,14 +521,17 @@ def cmd_index(mount, cache_dir, db_path, udid):
     p.close()
     if tokens:
         con.executemany(
-            "INSERT INTO token(asset_uuid, lexeme, norm, category, source) "
-            "VALUES(?, ?, ?, ?, ?)", tokens)
+            "INSERT INTO token(asset_uuid, lexeme, norm, category, source, provider) "
+            "VALUES(?, ?, ?, ?, ?, 'leo')", tokens)
 
     # --- английские caption'ы (дешёво, пересобираем целиком) ----------------
+    # Кроме общего caption'а ассета берём и посегментные caption'ы видео —
+    # они заметно подробнее и дают слова, которых в общем нет.
     con.execute("DELETE FROM caption")
     if fp_media and os.path.exists(media_copy):
         m = open_ro(media_copy)
         caps = []
+        seen_caps = set()
         for table in ("ZIMAGECAPTIONRESULT", "ZVIDEOCAPTIONRESULT"):
             try:
                 rows = m.execute(
@@ -310,11 +541,90 @@ def cmd_index(mount, cache_dir, db_path, udid):
                 continue
             for loc, text in rows:
                 uuid = (loc or "")[:36]
-                if uuid in assets and text:
-                    caps.append((uuid, text.strip(), "en"))
+                t = (text or "").strip()
+                if uuid in assets and t and (uuid, t) not in seen_caps:
+                    seen_caps.add((uuid, t))
+                    caps.append((uuid, t, "en"))
+        try:
+            rows = m.execute(
+                "SELECT s.ZLOCALIDENTIFIER, c.ZCAPTION FROM ZVIDEOSEGMENTCAPTIONRESULT c "
+                "JOIN ZASSET s ON s.Z_PK = c.ZASSET")
+        except sqlite3.Error:
+            rows = ()
+        for loc, text in rows:
+            uuid = (loc or "")[:36]
+            t = (text or "").strip()
+            if uuid in assets and t and (uuid, t) not in seen_caps:
+                seen_caps.add((uuid, t))
+                caps.append((uuid, t, "en"))
         m.close()
         con.executemany(
             "INSERT INTO caption(asset_uuid, text, lang) VALUES(?, ?, ?)", caps)
+
+    # --- метки MediaAnalysis (сцены по кадрам, действия, питомцы) -------------
+    # Пересобираем целиком (provider='ma'): объём небольшой, зато метки не
+    # остаются устаревшими, если MediaAnalysis обновилась, а набор ассетов — нет.
+    con.execute("DELETE FROM token WHERE provider='ma'")
+    ma_tokens = []
+    if fp_media and os.path.exists(media_copy):
+        m = open_ro(media_copy)
+        ma_assets = {}
+        for zid, loc in m.execute("SELECT Z_PK, ZLOCALIDENTIFIER FROM ZASSET"):
+            if loc:
+                ma_assets[zid] = loc[:36]
+
+        # Сцены: числовые ZSCENEID -> русские метки. Для каждой пары
+        # (ассет, сцена) берём максимальную уверенность по всем кадрам.
+        scene_max = {}
+        for zid, sid, conf in m.execute(
+                "SELECT ZASSET, ZSCENEID, ZCONFIDENCE FROM ZCLASSIFICATIONRESULT"):
+            uuid = ma_assets.get(zid)
+            if not uuid or uuid not in assets:
+                continue
+            key = (uuid, str(sid))
+            c = float(conf or 0)
+            if c > scene_max.get(key, -1.0):
+                scene_max[key] = c
+        seen_rows = set()
+        for (uuid, sid), conf in scene_max.items():
+            if conf < SCENE_MIN_CONF:
+                continue
+            for label in taxonomy.get("scene/" + sid, ()):
+                row = (uuid, label, stem_ru(label), 4000, "scene")
+                if row not in seen_rows:
+                    seen_rows.add(row)
+                    ma_tokens.append(row)
+
+        # Действия человека: id спрятаны в NSKeyedArchiver-блобе.
+        for zid, blob in m.execute(
+                "SELECT ZASSET, ZACTIONSCONFIDENCE FROM ZHUMANACTIONCLASSIFICATIONRESULT"):
+            uuid = ma_assets.get(zid)
+            if not uuid or uuid not in assets or not blob:
+                continue
+            for aid, conf in parse_action_confidences(blob).items():
+                if conf < ACTION_MIN_CONF:
+                    continue
+                for label in taxonomy.get("humanAction/" + aid, ()):
+                    row = (uuid, label, stem_ru(label), 4060, "action")
+                    if row not in seen_rows:
+                        seen_rows.add(row)
+                        ma_tokens.append(row)
+
+        # Питомцы: у детектора нет вида, поэтому одна общая метка.
+        pet_seen = set()
+        for zid, conf in m.execute("SELECT ZASSET, ZPETSCONFIDENCE FROM ZPETSRESULT"):
+            uuid = ma_assets.get(zid)
+            if not uuid or uuid not in assets or uuid in pet_seen:
+                continue
+            if float(conf or 0) < PET_MIN_CONF:
+                continue
+            pet_seen.add(uuid)
+            ma_tokens.append((uuid, "Питомец", stem_ru("Питомец"), 0, "pet"))
+        m.close()
+        if ma_tokens:
+            con.executemany(
+                "INSERT INTO token(asset_uuid, lexeme, norm, category, source, provider) "
+                "VALUES(?, ?, ?, ?, ?, 'ma')", ma_tokens)
 
     set_meta(con, "udid", udid)
     set_meta(con, "version", INDEX_VERSION)
@@ -327,7 +637,8 @@ def cmd_index(mount, cache_dir, db_path, udid):
         pass
     con.close()
 
-    print("Готово: %d ассетов, +%d лексем" % (len(assets), len(tokens)))
+    print("Готово: %d ассетов, +%d лексем (Leo), +%d меток (MediaAnalysis)"
+          % (len(assets), len(tokens), len(ma_tokens)))
     return 0
 
 
