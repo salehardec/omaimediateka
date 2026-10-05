@@ -234,6 +234,177 @@ test("cmd_index: версия 2, provider, инкрементальный пов
 test("cmd_index: миграция кэша версии 1 (добавляется provider)",
      lambda: run_case(case_migration_v1))
 
+
+# --- устойчивость к EIO при копировании через AFC --------------------------
+
+def case_copy_retries():
+    tmp = tempfile.mkdtemp(prefix="oma-copy-test-")
+    try:
+        src = os.path.join(tmp, "src.sqlite")
+        with open(src, "wb") as f:
+            f.write(b"hello-world")
+        dst_dir = os.path.join(tmp, "cache")
+        calls = {"n": 0}
+        orig = mod._copy_file_once
+
+        def flaky(s, t):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise OSError(5, "Input/output error")
+            orig(s, t)
+
+        mod._copy_file_once = flaky
+        try:
+            made = mod.copy_db(src, dst_dir, "Photos.sqlite", attempts=3)
+        finally:
+            mod._copy_file_once = orig
+        assert_eq(made, True, "made")
+        assert_eq(calls["n"], 3, "attempts")
+        assert_eq(open(os.path.join(dst_dir, "Photos.sqlite"), "rb").read(),
+                  b"hello-world", "content")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_copy_failure_preserves():
+    tmp = tempfile.mkdtemp(prefix="oma-copy-test-")
+    try:
+        src = os.path.join(tmp, "src.sqlite")
+        with open(src, "wb") as f:
+            f.write(b"new-data")
+        dst_dir = os.path.join(tmp, "cache")
+        os.makedirs(dst_dir)
+        dst = os.path.join(dst_dir, "Photos.sqlite")
+        with open(dst, "wb") as f:
+            f.write(b"OLD-GOOD")
+        orig = mod._copy_file_once
+
+        def boom(s, t):
+            raise OSError(5, "Input/output error")
+
+        mod._copy_file_once = boom
+        try:
+            raised = False
+            try:
+                mod.copy_db(src, dst_dir, "Photos.sqlite", attempts=2)
+            except OSError:
+                raised = True
+            assert raised, "должно бросить OSError"
+        finally:
+            mod._copy_file_once = orig
+        assert_eq(open(dst, "rb").read(), b"OLD-GOOD", "старая копия цела")
+        assert not os.path.exists(dst + ".tmp"), "не осталось .tmp"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_index_io_error(mount, cache, db):
+    orig = mod._copy_file_once
+
+    def boom(s, t):
+        raise OSError(5, "Input/output error")
+
+    mod._copy_file_once = boom
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = mod.cmd_index(mount, cache, db, "TEST-UDID")
+    finally:
+        mod._copy_file_once = orig
+    assert_eq(rc, mod.INDEX_EXIT_IO, "rc")
+    assert "разблокируйте iPhone" in buf.getvalue(), buf.getvalue()
+    assert "Traceback" not in buf.getvalue(), buf.getvalue()
+    # база не должна появиться: сборка не дошла до неё
+    assert not os.path.exists(db), "DB не создана при ошибке копирования"
+
+
+def case_index_locked(mount, cache, db):
+    os.makedirs(cache, exist_ok=True)
+    held = mod._acquire_lock(cache, timeout=0)
+    assert held is not None, "не удалось взять лок"
+    os.environ["OMA_INDEX_LOCK_TIMEOUT"] = "0"
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = mod.cmd_index(mount, cache, db, "TEST-UDID")
+    finally:
+        held.close()
+        os.environ.pop("OMA_INDEX_LOCK_TIMEOUT", None)
+    assert_eq(rc, mod.INDEX_EXIT_LOCKED, "rc")
+    assert "уже" in buf.getvalue(), buf.getvalue()
+
+
+test("copy_db: ретраи при EIO и успех с третьей попытки",
+     lambda: case_copy_retries())
+test("copy_db: ошибка не портит старую копию и не оставляет .tmp",
+     lambda: case_copy_failure_preserves())
+
+
+def case_truncated_detection():
+    fp = ":10:5|-wal:0:1"
+    assert_eq(mod.fingerprint_size(fp), 10, "size")
+    assert_eq(mod.fingerprint_size(""), -1, "empty")
+    assert_eq(mod.copy_truncated("/no/such/file", fp), True, "missing")
+    tmp = tempfile.mkdtemp(prefix="oma-trunc-test-")
+    try:
+        p = os.path.join(tmp, "copy")
+        with open(p, "wb") as f:
+            f.write(b"0123456789")
+        assert_eq(mod.copy_truncated(p, fp), False, "full")
+        with open(p, "wb") as f:
+            f.write(b"01234")
+        assert_eq(mod.copy_truncated(p, fp), True, "усечённая")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_truncated_copy_heals(mount, cache, db):
+    index(mount, cache, db)
+    cp = os.path.join(cache, "Photos.sqlite")
+    want = os.path.getsize(os.path.join(mount, "PhotoData", "Photos.sqlite"))
+    with open(cp, "wb") as f:  # имитируем обрыв старого EIO
+        f.write(b"broken")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.cmd_index(mount, cache, db, "TEST-UDID")
+    assert_eq(rc, 0, "rc")
+    assert "Копирую базы" in buf.getvalue(), buf.getvalue()
+    assert_eq(os.path.getsize(cp), want, "копия восстановлена")
+
+
+test("copy_truncated: различает полную и оборванную копию",
+     lambda: case_truncated_detection())
+test("cmd_index: усечённая копия перекачивается (самолечение)",
+     lambda: run_case(case_truncated_copy_heals))
+
+
+def case_malformed_copy_heals(mount, cache, db):
+    index(mount, cache, db)
+    cp = os.path.join(cache, "Photos.sqlite")
+    size = os.path.getsize(cp)
+    with open(cp, "wb") as f:  # тот же размер, но мусор
+        f.write(b"\x00" * size)
+    # заставляем пересборку из копий (как при смене версии)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE meta SET value='1' WHERE key='version'")
+    con.commit()
+    con.close()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        rc = mod.cmd_index(mount, cache, db, "TEST-UDID")
+    assert_eq(rc, mod.INDEX_EXIT_IO, "rc")
+    assert "повреждены" in buf.getvalue(), buf.getvalue()
+    assert not os.path.exists(cp), "битая копия удалена"
+
+
+test("cmd_index: побитая копия -> понятная ошибка и удаление",
+     lambda: run_case(case_malformed_copy_heals))
+
+test("cmd_index: EIO -> код 2 и понятное сообщение вместо traceback",
+     lambda: run_case(case_index_io_error))
+test("cmd_index: занятый лок -> код 3 без копирования",
+     lambda: run_case(case_index_locked))
+
 print("\n%d passed" % passed)
 if failed:
     sys.exit(1)

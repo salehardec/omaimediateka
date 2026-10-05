@@ -179,7 +179,9 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
 - **Content search** reuses an undocumented Apple index: ~99.5 % of assets are
   covered, assets stored only in iCloud are skipped (no local file), and an iOS
   update may change the schema — in which case search degrades gracefully to
-  name/folder filtering.
+  name/folder filtering. If the iPhone gets locked mid-index, the copy is retried
+  three times and the status line then shows “Нет доступа к телефону:
+  разблокируйте iPhone и повторите”; the previous index keeps working.
 - The content index is built per device in `~/.cache/omaimediateka/` and refreshed
   when the phone reconnects; the first build copies ~330 MB over USB (~15 s).
 - One iPhone at a time; the first detected device wins.

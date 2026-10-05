@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import struct
 import sys
+import time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS asset(
@@ -60,6 +61,18 @@ VIDEO_EXTS = {"mp4", "mov", "m4v"}
 # Версия формата компактного кэша; при смене логики нормализации/схемы
 # инкрементальный кэш пересобирается с нуля.
 INDEX_VERSION = "2"
+
+# Коды возврата `index` (их разбирает Panel.qml).
+INDEX_EXIT_OK = 0
+INDEX_EXIT_NO_DEVICE = 1
+INDEX_EXIT_IO = 2
+INDEX_EXIT_LOCKED = 3
+INDEX_EXIT_NO_PYTHON = 4
+
+# Чтение через AFC может падать с EIO (телефон заблокирован, гонка, обрыв):
+# копируем через временный файл, повторяем и подменяем цели атомарно.
+COPY_ATTEMPTS = 3
+LOCK_TIMEOUT_S = 300.0
 
 # Порядок источников в выдаче (чем раньше, тем выше в бейдже).
 SOURCE_ORDER = [
@@ -210,25 +223,125 @@ def load_taxonomy(con_photos):
     return taxonomy
 
 
-def copy_db(src, dst_dir, name):
-    """Копирует базу и её -wal/-shm в кэш, схлопывает WAL на копии."""
-    made = False
+def fingerprint_size(fp):
+    """Размер базового файла из строки fingerprint (-1, если не распознан)."""
+    try:
+        return int(fp.split("|", 1)[0].split(":")[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def copy_truncated(copy_path, fp):
+    """Похоже ли, что локальная копия оборвана (старый EIO без .tmp)?"""
+    want = fingerprint_size(fp)
+    if want < 0:
+        return False
+    try:
+        return os.path.getsize(copy_path) != want
+    except OSError:
+        return True
+
+
+def _copy_file_once(src, tmp):
+    """Одно копирование src -> tmp блоками (без подмены цели)."""
+    with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+        shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+        fdst.flush()
+        os.fsync(fdst.fileno())
+
+
+def copy_db(src, dst_dir, name, attempts=COPY_ATTEMPTS):
+    """Копирует базу и её -wal/-shm в кэш, схлопывает WAL на копии.
+
+    Чтение через AFC может падать с ``OSError: [Errno 5] Input/output error``
+    (телефон заблокирован, гонка за AFC, обрыв mount). Поэтому каждая часть
+    пишется во временный файл, при ошибке попытка повторяется (до `attempts`
+    раз с нарастающей паузой), а цели подменяются только когда скопировались
+    все части. При ошибке старые рабочие копии остаются нетронутыми, и поиск
+    продолжает работать на прежнем кэше.
+    """
+    dst_base = os.path.join(dst_dir, name)
+    os.makedirs(dst_dir, exist_ok=True)
+    parts = []
     for suf in ("", "-wal", "-shm"):
         s = src + suf
-        d = os.path.join(dst_dir, name) + suf
-        if os.path.exists(s):
-            shutil.copyfile(s, d)
-            made = True
-        elif os.path.exists(d):
-            os.remove(d)
-    if made:
         try:
-            con = sqlite3.connect(os.path.join(dst_dir, name))
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            con.close()
-        except sqlite3.Error:
-            pass
-    return made
+            exists = os.path.exists(s)
+        except OSError:
+            exists = False
+        if exists:
+            parts.append((s, dst_base + suf))
+    if not parts:
+        return False
+
+    for attempt in range(attempts):
+        staged = []
+        try:
+            for s, d in parts:
+                tmp = d + ".tmp"
+                _copy_file_once(s, tmp)
+                staged.append((tmp, d))
+            for tmp, d in staged:
+                os.replace(tmp, d)
+            keep = {d for _, d in parts}
+            for suf in ("", "-wal", "-shm"):
+                d = dst_base + suf
+                if d not in keep:
+                    try:
+                        os.remove(d)
+                    except OSError:
+                        pass
+            break
+        except OSError:
+            for _, d in parts:
+                try:
+                    os.remove(d + ".tmp")
+                except OSError:
+                    pass
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.6 * (attempt + 1))
+
+    try:
+        con = sqlite3.connect(dst_base)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
+    except sqlite3.Error:
+        pass
+    return True
+
+
+def _lock_timeout():
+    try:
+        return float(os.environ.get("OMA_INDEX_LOCK_TIMEOUT", LOCK_TIMEOUT_S))
+    except ValueError:
+        return LOCK_TIMEOUT_S
+
+
+def _acquire_lock(cache_dir, timeout=None):
+    """Файловый лок: два `index` не должны качать базы одновременно.
+
+    Возвращает открытый файл (его надо держать открытым до конца работы) или
+    None, если лок занят дольше timeout. На не-Linux fcntl нет — тогда
+    работаем без лока, а не падаем.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return open(os.devnull, "w")
+    path = os.path.join(cache_dir, ".index.lock")
+    os.makedirs(cache_dir, exist_ok=True)
+    fd = open(path, "w")
+    deadline = time.monotonic() + (_lock_timeout() if timeout is None else timeout)
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                return None
+            time.sleep(0.5)
 
 
 def get_meta(con, key):
@@ -241,14 +354,50 @@ def set_meta(con, key, value):
 
 
 def cmd_index(mount, cache_dir, db_path, udid):
+    """Обёртка: лок от параллельного запуска и понятная ошибка AFC."""
+    photos_src = os.path.join(mount, "PhotoData", "Photos.sqlite")
+    try:
+        has_photos = os.path.exists(photos_src)
+    except OSError:
+        has_photos = False
+    if not has_photos:
+        sys.stderr.write("нет %s — iPhone не смонтирован или нет доступа\n" % photos_src)
+        return INDEX_EXIT_NO_DEVICE
+    os.makedirs(cache_dir, exist_ok=True)
+    lock = _acquire_lock(cache_dir)
+    if lock is None:
+        sys.stderr.write("Индексация уже выполняется другим процессом — подождите\n")
+        return INDEX_EXIT_LOCKED
+    try:
+        return _do_index(mount, cache_dir, db_path, udid)
+    except OSError as e:
+        sys.stderr.write(
+            "Нет доступа к телефону: разблокируйте iPhone и повторите (%s)\n"
+            % (getattr(e, "strerror", None) or e))
+        return INDEX_EXIT_IO
+    except sqlite3.DatabaseError:
+        # Локальная копия побита (например, след старого оборванного EIO) —
+        # сносим её, чтобы следующий запуск скачал заново, а не падал.
+        for nm in ("Photos.sqlite", "MediaAnalysis.sqlite"):
+            for suf in ("", "-wal", "-shm"):
+                try:
+                    os.remove(os.path.join(cache_dir, nm + suf))
+                except OSError:
+                    pass
+        sys.stderr.write("Базы Apple повреждены — переподключите iPhone и повторите\n")
+        return INDEX_EXIT_IO
+    finally:
+        try:
+            lock.close()
+        except OSError:
+            pass
+
+
+def _do_index(mount, cache_dir, db_path, udid):
     photos_src = os.path.join(mount, "PhotoData", "Photos.sqlite")
     media_src = os.path.join(mount, "MediaAnalysis", "MediaAnalysis.sqlite")
     photos_copy = os.path.join(cache_dir, "Photos.sqlite")
     media_copy = os.path.join(cache_dir, "MediaAnalysis.sqlite")
-
-    if not os.path.exists(photos_src):
-        sys.stderr.write("нет %s — iPhone не смонтирован или нет доступа\n" % photos_src)
-        return 1
 
     os.makedirs(cache_dir, exist_ok=True)
     reuse = os.environ.get("OMA_INDEX_REUSE") == "1"
@@ -269,10 +418,15 @@ def cmd_index(mount, cache_dir, db_path, udid):
             ver_ok = get_meta(con, "version") == INDEX_VERSION
             has_assets = con.execute("SELECT COUNT(*) FROM asset").fetchone()[0] > 0
             con.close()
-            if fp_ok and ver_ok and has_assets:
+            # Обрыв копирования в старой версии мог оставить усечённый файл:
+            # тогда перекачиваем, даже если отпечатки сошлись.
+            copies_ok = copies_exist and \
+                not copy_truncated(photos_copy, fp_photos) and \
+                (not fp_media or not copy_truncated(media_copy, fp_media))
+            if fp_ok and ver_ok and has_assets and copies_ok:
                 print("Индекс актуален")
                 return 0
-            if fp_ok and copies_exist:
+            if fp_ok and copies_exist and copies_ok:
                 # Базы не менялись, устарела лишь схема/логика кэша —
                 # пересобираем из уже лежащих копий, не перекачивая 350 МБ.
                 need_copy = False
