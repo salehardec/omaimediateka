@@ -312,7 +312,7 @@ def case_index_io_error(mount, cache, db):
     finally:
         mod._copy_file_once = orig
     assert_eq(rc, mod.INDEX_EXIT_IO, "rc")
-    assert "разблокируйте iPhone" in buf.getvalue(), buf.getvalue()
+    assert "завершите звонок" in buf.getvalue(), buf.getvalue()
     assert "Traceback" not in buf.getvalue(), buf.getvalue()
     # база не должна появиться: сборка не дошла до неё
     assert not os.path.exists(db), "DB не создана при ошибке копирования"

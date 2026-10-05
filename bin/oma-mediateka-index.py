@@ -372,7 +372,8 @@ def cmd_index(mount, cache_dir, db_path, udid):
         return _do_index(mount, cache_dir, db_path, udid)
     except OSError as e:
         sys.stderr.write(
-            "Нет доступа к телефону: разблокируйте iPhone и повторите (%s)\n"
+            "Нет доступа к телефону: разблокируйте iPhone, завершите звонок "
+            "и повторите (%s)\n"
             % (getattr(e, "strerror", None) or e))
         return INDEX_EXIT_IO
     except sqlite3.DatabaseError:
