@@ -343,7 +343,7 @@ FORCE=0
 now() { printf '%s' "${OMA_NOW:-$(date +%s)}"; }
 
 android_state_load() {
-  S_TS=0; S_UNTIL=0; S_KEY=""; S_ATTEMPT=""
+  S_TS=0; S_UNTIL=0; S_KEY=""; S_ATTEMPT=""; S_FAILS=0
   S_STATE=""; S_BACKEND=""; S_NAME=""; S_MODEL=""; S_ID=""; S_MOUNT=""; S_ROOTS=""; S_MSG=""
   # shellcheck disable=SC1090
   [ -f "$MTP_STATE" ] && . "$MTP_STATE" 2>/dev/null
@@ -355,7 +355,7 @@ android_state_save() {
   local tmp v ref
   tmp="$(mktemp "$MTP_STATE.XXXXXX")" || return 0
   {
-    printf 'S_TS=%q\nS_UNTIL=%q\nS_KEY=%q\nS_ATTEMPT=%q\n' "$(now)" "$NEW_UNTIL" "$NEW_KEY" "$NEW_ATTEMPT"
+    printf 'S_TS=%q\nS_UNTIL=%q\nS_KEY=%q\nS_ATTEMPT=%q\nS_FAILS=%q\n' "$(now)" "$NEW_UNTIL" "$NEW_KEY" "$NEW_ATTEMPT" "$NEW_FAILS"
     for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
       ref="D_$v"
       printf 'S_%s=%q\n' "$v" "${!ref}"
@@ -370,6 +370,14 @@ android_state_apply() {
     ref="S_$v"
     declare -g "D_$v=${!ref}"
   done
+}
+
+# Бэкофф растёт при повторных неудачах на том же подключении: 30, 60, 120, 240, 300 с.
+backoff_secs() {
+  local n="$1" b="$MTP_BACKOFF"
+  while [ "$n" -gt 0 ] && [ "$b" -lt 300 ]; do b=$((b * 2)); n=$((n - 1)); done
+  [ "$b" -gt 300 ] && [ "$MTP_BACKOFF" -le 300 ] && b=300
+  printf '%s' "$b"
 }
 
 # Ключ подключения: USB-устройство тома (меняется при переподключении).
@@ -388,7 +396,7 @@ probe_android() {
   local t usb=0 backend=0 mount force_ok=0
   t="$(now)"
   android_state_load
-  NEW_UNTIL=0; NEW_KEY=""; NEW_ATTEMPT="$S_ATTEMPT"; REUSED=0
+  NEW_UNTIL=0; NEW_KEY=""; NEW_ATTEMPT="$S_ATTEMPT"; NEW_FAILS=0; REUSED=0
 
   android_usb_present && usb=1
   have_gvfs_backend gvfsd-mtp gvfs-mtp && backend=1
@@ -410,7 +418,7 @@ probe_android() {
   if [ -n "$key" ] && [ "$S_KEY" = "$key" ] && [ -n "$S_STATE" ] && [ "$force_ok" = 0 ] \
      && [ "$t" -lt "$S_UNTIL" ]; then
     android_state_apply
-    NEW_UNTIL="$S_UNTIL"; NEW_KEY="$S_KEY"; REUSED=1
+    NEW_UNTIL="$S_UNTIL"; NEW_KEY="$S_KEY"; NEW_FAILS="$S_FAILS"; REUSED=1
     return 0
   fi
 
@@ -426,7 +434,8 @@ probe_android() {
       D_MODEL="$(clean_model "$(mtp_display_name "$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')")")"
       D_NAME="${D_MODEL:-Android}"
       D_MSG="Разблокируйте телефон и выберите «Передача файлов», затем нажмите «Проверить снова»."
-      NEW_UNTIL=$((t + MTP_BACKOFF)); NEW_KEY="$key"
+      [ "$S_KEY" = "$key" ] && NEW_FAILS=$((S_FAILS + 1))
+      NEW_UNTIL=$((t + $(backoff_secs "$NEW_FAILS"))); NEW_KEY="$key"
       [ -n "$D_MODEL" ] || D_MODEL="$(clean_model "$(android_usb_product || true)")"
       return 0
     fi
@@ -467,7 +476,8 @@ probe_android() {
       # Том пуст: телефон заблокирован или не отдаёт хранилище. Не дёргаем.
       D_STATE="locked"
       D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов», затем нажмите «Проверить снова»."
-      NEW_UNTIL=$((t + MTP_BACKOFF))
+      [ "$S_KEY" = "$mount" ] && NEW_FAILS=$((S_FAILS + 1))
+      NEW_UNTIL=$((t + $(backoff_secs "$NEW_FAILS")))
     fi
   elif [ "$usb" = 1 ] && [ "$backend" = 0 ]; then
     D_STATE="no-backend"

@@ -596,6 +596,22 @@ def t_backoff_after_locked_no_device_access(e):
     assert_eq(e.touches(), second, "и снова пауза")
 
 
+def t_backoff_grows_on_repeated_locked(e):
+    e.install_mtp_backend()
+    e.phone(storages=())
+    seen = []
+    t = 1000
+    for _ in range(6):
+        e.at(t)
+        e.status()
+        state = open(os.path.join(e.cache, "omaimediateka", "android-state", "android.state")).read()
+        f = dict(l.split("=", 1) for l in state.splitlines() if l.startswith(("S_TS=", "S_UNTIL=")))
+        gap = int(f["S_UNTIL"]) - int(f["S_TS"])
+        seen.append(gap)
+        t = int(f["S_UNTIL"]) + 1
+    assert_eq(seen, [30, 60, 120, 240, 300, 300], "паузы растут до 300 с")
+
+
 def t_force_overrides_backoff_but_is_throttled(e):
     e.install_mtp_backend()
     e.phone(storages=())
@@ -752,6 +768,7 @@ def main():
         ("model: iPhone без ideviceinfo-ответа — пусто", t_model_iphone_unavailable_is_empty),
         ("model: нет устройства — пусто", t_model_empty_without_device),
         ("бэкофф ≥30 с: после locked к телефону не обращаемся", t_backoff_after_locked_no_device_access),
+        ("бэкофф растёт при повторном locked до 300 с", t_backoff_grows_on_repeated_locked),
         ("force обходит бэкофф, но не чаще 10 с", t_force_overrides_backoff_but_is_throttled),
         ("ready переиспользуется в пределах TTL без обращений", t_ready_state_reused_without_touching_phone),
         ("монтирование: одна попытка на подключение", t_mount_attempted_once_per_connection),
