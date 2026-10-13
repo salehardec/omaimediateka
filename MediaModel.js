@@ -481,6 +481,18 @@ function deviceTypeLabel(type) {
   return type === "android" ? "Android" : "iPhone"
 }
 
+// Подпись пилюли в баре: без устройства — «Omaimediateka», иначе тип и модель
+// («iPhone 15 Pro», «Android Pixel 8»); нет модели — просто «iPhone»/«Android».
+// Модель iPhone уже начинается с «iPhone», слово не повторяем.
+function pillLabel(type, model) {
+  if (type !== "iphone" && type !== "android") return "Omaimediateka"
+  var label = deviceTypeLabel(type)
+  var m = String(model || "").trim()
+  if (m === "") return label
+  if (m.toLowerCase().indexOf(label.toLowerCase()) === 0) return m
+  return label + " " + m
+}
+
 // Ключ устройства для кэшей: тип и id (UDID или host MTP).
 function deviceKey(device) {
   if (!device || !device.type || device.type === "none" || !device.id) return ""
@@ -558,6 +570,7 @@ if (typeof module !== "undefined" && module.exports) {
     filterItems: filterItems,
     dateText: dateText,
     deviceTypeLabel: deviceTypeLabel,
+    pillLabel: pillLabel,
     deviceKey: deviceKey,
     parseQuery: parseQuery,
     stemRu: stemRu,

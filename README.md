@@ -16,7 +16,11 @@ disappears automatically when it is unplugged.
 
 ## Features
 
-- **Bar pill** `iPhone · N` / `Android · N` — device type and number of media files found.
+- **Bar pill** — `Omaimediateka · —` when no phone is connected, `iPhone 15 Pro · N` /
+  `Android Pixel 8 · N` when one is (N = media files found). The model comes from
+  `ideviceinfo -k ProductType` (mapped to a marketing name; unknown types are shown
+  as-is) or from the MTP/USB name; if it cannot be determined, just `iPhone`/`Android`.
+  Long names are truncated with “…” so the bar keeps its layout.
 - **iPhone and Android** side by side: the popup shows the device type and name; if
   both are plugged in, a switcher in the popup picks which one to browse (the
   ready device is shown first, the iPhone wins a tie).
@@ -180,7 +184,7 @@ Uninstall with `./install.sh --uninstall`.
   fetched from the phone before its poster can be taken.
 - **`bin/oma-mediateka`** is the only component that knows about the backend:
   - `status [iphone|android]` — detects devices, trust/transfer mode and mount (one
-    JSON line: `state`, `type` = `iphone`/`android`/`none`, `name`, `id`, `roots`, and
+    JSON line: `state`, `type` = `iphone`/`android`/`none`, `name`, `model`, `id`, `roots`, and
     a `devices` list of everything found);
   - `list [--cache KEY] <dir>...` — a single `find` pass over media files in one or
     more roots (TSV); `list-cached <KEY>` prints the last saved listing;

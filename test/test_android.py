@@ -74,6 +74,10 @@ class Env:
               0o755)
         write(os.path.join(self.bin, "idevice_id"),
               '#!/bin/sh\ncat "%s"\n' % self.udids, 0o755)
+        self.product_type = os.path.join(self.root, "product-type.txt")
+        write(self.product_type, "")
+        write(os.path.join(self.bin, "ideviceinfo"),
+              '#!/bin/sh\n[ -s "%s" ] && cat "%s"\n' % (self.product_type, self.product_type), 0o755)
         write(os.path.join(self.bin, "idevicepair"), "#!/bin/sh\nexit 0\n", 0o755)
         write(os.path.join(self.bin, "pacman"), "#!/bin/sh\nexit 1\n", 0o755)
         self.env = dict(
@@ -91,9 +95,11 @@ class Env:
     def install_mtp_backend(self):
         write(os.path.join(self.libs, "gvfsd-mtp"), "#!/bin/sh\n", 0o755)
 
-    def usb_device(self, name, vendor, classes=()):
+    def usb_device(self, name, vendor, classes=(), product=None):
         d = os.path.join(self.usb, name)
         write(os.path.join(d, "idVendor"), vendor + "\n")
+        if product:
+            write(os.path.join(d, "product"), product + "\n")
         for i, cls in enumerate(classes):
             write(os.path.join(d, "%s:1.%d" % (name, i), "bInterfaceClass"), cls + "\n")
 
@@ -473,6 +479,63 @@ def t_search_still_available_with_iphone(e):
     assert_eq(e.helper("search", "море").returncode, 1, "search rc без индекса")
 
 
+# --- модель устройства для плашки ---------------------------------------------
+
+def t_model_android_from_mtp_name(e):
+    e.install_mtp_backend()
+    e.phone(host="Google_Pixel_8_XYZ")
+    write(e.gio_list, "Mount(0): Pixel 8 -> mtp://Google_Pixel_8_XYZ/\n")
+    assert_eq(e.status()["model"], "Pixel 8", "model")
+
+
+def t_model_android_generic_name_uses_usb_product(e):
+    e.install_mtp_backend()
+    e.phone(host="SAMSUNG_SAMSUNG_Android_R58")
+    write(e.gio_list, "Mount(0): SAMSUNG_Android -> mtp://SAMSUNG_SAMSUNG_Android_R58/\n")
+    e.usb_device("1-4", "04e8", product="SM-S911B")
+    assert_eq(e.status()["model"], "SM-S911B", "model из USB product")
+
+
+def t_model_android_charge_only_from_usb(e):
+    e.install_mtp_backend()
+    e.usb_device("1-4", "18d1", product="Pixel 8")
+    s = e.status()
+    assert_eq((s["state"], s["model"]), ("charge-only", "Pixel 8"), "state/model")
+
+
+def t_model_android_unknown_is_empty(e):
+    e.install_mtp_backend()
+    e.phone(host="Some_Phone")
+    s = e.status()
+    assert_eq(s["model"], "", "модели нет — пусто, имя остаётся запасным")
+    assert_eq(s["name"], "Some Phone", "name")
+
+
+def t_model_iphone_marketing_name(e):
+    e.install_mtp_backend()
+    e.iphone()
+    write(e.product_type, "iPhone16,1\n")
+    assert_eq(e.status()["model"], "iPhone 15 Pro", "model")
+
+
+def t_model_iphone_unknown_product_type_kept(e):
+    e.install_mtp_backend()
+    e.iphone()
+    write(e.product_type, "iPhone99,9\n")
+    assert_eq(e.status()["model"], "iPhone99,9", "ProductType как есть")
+
+
+def t_model_iphone_unavailable_is_empty(e):
+    e.install_mtp_backend()
+    e.iphone()
+    assert_eq(e.status()["model"], "", "ideviceinfo молчит — модели нет")
+
+
+def t_model_empty_without_device(e):
+    e.install_mtp_backend()
+    assert_eq(e.status()["model"], "", "model")
+
+
 def main():
     cases = [
         ("status: нет устройства", t_no_device),
@@ -490,6 +553,14 @@ def main():
         ("status: оба подключены — iPhone по умолчанию, выбор по аргументу", t_both_connected),
         ("status: оба подключены — готовое устройство первым", t_both_prefers_ready_one),
         ("status: запрошенного устройства нет — запасной показ", t_prefer_missing_device_falls_back),
+        ("model: Android из MTP-имени", t_model_android_from_mtp_name),
+        ("model: общее MTP-имя → USB product", t_model_android_generic_name_uses_usb_product),
+        ("model: Android в режиме зарядки — из USB", t_model_android_charge_only_from_usb),
+        ("model: Android без модели — пусто", t_model_android_unknown_is_empty),
+        ("model: iPhone ProductType → «iPhone 15 Pro»", t_model_iphone_marketing_name),
+        ("model: неизвестный ProductType остаётся как есть", t_model_iphone_unknown_product_type_kept),
+        ("model: iPhone без ideviceinfo-ответа — пусто", t_model_iphone_unavailable_is_empty),
+        ("model: нет устройства — пусто", t_model_empty_without_device),
         ("list: несколько корней, скрытое и не-медиа отброшено", t_list_android_roots),
         ("list: пустой каталог и usage", t_list_missing_dir_is_empty),
         ("list --cache / list-cached: кэш листинга", t_list_cache),

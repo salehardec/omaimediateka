@@ -457,4 +457,20 @@ test("defaultExportDir/deviceTypeLabel/deviceKey по типу устройст�
   assert.strictEqual(M.deviceKey(null), "")
 })
 
+test("pillLabel: нет устройства / iPhone с моделью / Android с моделью", () => {
+  assert.strictEqual(M.pillLabel("none", ""), "Omaimediateka")
+  assert.strictEqual(M.pillLabel("", "iPhone 15 Pro"), "Omaimediateka")
+  assert.strictEqual(M.pillLabel("iphone", "iPhone 15 Pro"), "iPhone 15 Pro")
+  assert.strictEqual(M.pillLabel("android", "Pixel 8"), "Android Pixel 8")
+})
+
+test("pillLabel: модель не определилась — просто тип; без дублей слова", () => {
+  assert.strictEqual(M.pillLabel("iphone", ""), "iPhone")
+  assert.strictEqual(M.pillLabel("android", ""), "Android")
+  assert.strictEqual(M.pillLabel("android", "  "), "Android")
+  assert.strictEqual(M.pillLabel("iphone", "iPhone16,1"), "iPhone16,1")
+  assert.strictEqual(M.pillLabel("iphone", "SE"), "iPhone SE")
+  assert.strictEqual(M.pillLabel("android", "Android One"), "Android One")
+})
+
 console.log("\n" + passed + " passed")

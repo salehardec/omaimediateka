@@ -49,17 +49,17 @@ USB_SYSFS="${OMA_USB_SYSFS:-/sys/bus/usb/devices}"
 ANDROID_VENDORS="${OMA_ANDROID_VENDORS:-18d1 04e8 2717 12d1 2a70 22b8 0fce 1004 0bb4 22d9 0b05 2e04 2d95 1bbb 0e8d 19d2 2a45 05c6}"
 
 reset_dev() {
-  D_STATE="none"; D_BACKEND="none"; D_NAME=""; D_ID=""; D_MOUNT=""; D_ROOTS=""; D_MSG=""
+  D_STATE="none"; D_BACKEND="none"; D_NAME=""; D_MODEL=""; D_ID=""; D_MOUNT=""; D_ROOTS=""; D_MSG=""
 }
 
 save_dev() {
   declare -g "${1}_STATE=$D_STATE" "${1}_BACKEND=$D_BACKEND" "${1}_NAME=$D_NAME" \
-    "${1}_ID=$D_ID" "${1}_MOUNT=$D_MOUNT" "${1}_ROOTS=$D_ROOTS" "${1}_MSG=$D_MSG"
+    "${1}_MODEL=$D_MODEL" "${1}_ID=$D_ID" "${1}_MOUNT=$D_MOUNT" "${1}_ROOTS=$D_ROOTS" "${1}_MSG=$D_MSG"
 }
 
 load_dev() {
   local v
-  for v in STATE BACKEND NAME ID MOUNT ROOTS MSG; do
+  for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
     local ref="${1}_$v"
     declare -g "D_$v=${!ref}"
   done
@@ -80,9 +80,9 @@ json_array() {
 # Один JSON-объект на строку состояния: state type name id mount roots msg.
 emit() {
   local type="$1" devices="$2"
-  printf '{"state":"%s","backend":"%s","type":"%s","name":"%s","id":"%s","udid":"%s","mount":"%s","dcim":"%s","roots":%s,"devices":%s,"message":"%s"}\n' \
+  printf '{"state":"%s","backend":"%s","type":"%s","name":"%s","model":"%s","id":"%s","udid":"%s","mount":"%s","dcim":"%s","roots":%s,"devices":%s,"message":"%s"}\n' \
     "$(json_escape "$D_STATE")" "$(json_escape "$D_BACKEND")" "$type" \
-    "$(json_escape "$D_NAME")" "$(json_escape "$D_ID")" \
+    "$(json_escape "$D_NAME")" "$(json_escape "$D_MODEL")" "$(json_escape "$D_ID")" \
     "$([ "$type" = iphone ] && json_escape "$D_ID")" \
     "$(json_escape "$D_MOUNT")" "$(json_escape "$(printf '%s' "$D_ROOTS" | head -n1)")" \
     "$(json_array "$D_ROOTS")" "$devices" "$(json_escape "$D_MSG")"
@@ -122,6 +122,45 @@ have_gvfs_backend() {
   pacman -Qq "$2" >/dev/null 2>&1
 }
 
+# ProductType (iPhone16,1) -> «iPhone 15 Pro». Неизвестный тип остаётся как есть.
+iphone_marketing_name() {
+  case "$1" in
+    iPhone10,1|iPhone10,4) echo "iPhone 8" ;;
+    iPhone10,2|iPhone10,5) echo "iPhone 8 Plus" ;;
+    iPhone10,3|iPhone10,6) echo "iPhone X" ;;
+    iPhone11,2) echo "iPhone XS" ;;
+    iPhone11,4|iPhone11,6) echo "iPhone XS Max" ;;
+    iPhone11,8) echo "iPhone XR" ;;
+    iPhone12,1) echo "iPhone 11" ;;
+    iPhone12,3) echo "iPhone 11 Pro" ;;
+    iPhone12,5) echo "iPhone 11 Pro Max" ;;
+    iPhone12,8) echo "iPhone SE (2nd gen)" ;;
+    iPhone13,1) echo "iPhone 12 mini" ;;
+    iPhone13,2) echo "iPhone 12" ;;
+    iPhone13,3) echo "iPhone 12 Pro" ;;
+    iPhone13,4) echo "iPhone 12 Pro Max" ;;
+    iPhone14,2) echo "iPhone 13 Pro" ;;
+    iPhone14,3) echo "iPhone 13 Pro Max" ;;
+    iPhone14,4) echo "iPhone 13 mini" ;;
+    iPhone14,5) echo "iPhone 13" ;;
+    iPhone14,6) echo "iPhone SE (3rd gen)" ;;
+    iPhone14,7) echo "iPhone 14" ;;
+    iPhone14,8) echo "iPhone 14 Plus" ;;
+    iPhone15,2) echo "iPhone 14 Pro" ;;
+    iPhone15,3) echo "iPhone 14 Pro Max" ;;
+    iPhone15,4) echo "iPhone 15" ;;
+    iPhone15,5) echo "iPhone 15 Plus" ;;
+    iPhone16,1) echo "iPhone 15 Pro" ;;
+    iPhone16,2) echo "iPhone 15 Pro Max" ;;
+    iPhone17,1) echo "iPhone 16 Pro" ;;
+    iPhone17,2) echo "iPhone 16 Pro Max" ;;
+    iPhone17,3) echo "iPhone 16" ;;
+    iPhone17,4) echo "iPhone 16 Plus" ;;
+    iPhone17,5) echo "iPhone 16e" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 detect_iphone() {
   reset_dev
   D_NAME="iPhone"
@@ -143,6 +182,13 @@ detect_iphone() {
   local paired=1
   if command -v idevicepair >/dev/null 2>&1; then
     idevicepair -u "$udid" validate >/dev/null 2>&1 || paired=0
+  fi
+  if command -v ideviceinfo >/dev/null 2>&1; then
+    local pt
+    pt="$(timeout 3 ideviceinfo -u "$udid" -k ProductType 2>/dev/null | head -n1)"
+    case "$pt" in
+      iPhone*|iPad*|iPod*) D_MODEL="$(iphone_marketing_name "$pt")" ;;
+    esac
   fi
   if [ "$paired" = 1 ] && command -v idevicename >/dev/null 2>&1; then
     local nm
@@ -218,18 +264,45 @@ mtp_volume_uris() {
 }
 
 # Человеческое имя телефона по хосту: «Mount(0): Pixel 7 -> mtp://host/».
-mtp_name_for() {
-  local host="$1" name
-  local re
+mtp_display_name() {
+  local host="$1" name re
   re="$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')"
   name="$(gio_list | sed -n "s/^Mount([0-9]*): \(.*\) -> mtp:\/\/$re\/\$/\1/p" | head -n1)"
   if [ -z "$name" ]; then
     name="$(gio_list | sed -n "s/^Volume([0-9]*): \(.*\)\$/\1/p" | head -n1)"
   fi
-  if [ -z "$name" ]; then
-    name="${host//_/ }"
-  fi
+  printf '%s' "$name"
+}
+
+mtp_name_for() {
+  local name
+  name="$(mtp_display_name "$1")"
+  [ -n "$name" ] || name="${1//_/ }"
   printf '%s' "${name:-Android}"
+}
+
+# Модель из MTP-имени gvfs («Pixel 8»); пусто, если там только общее слово.
+clean_model() {
+  local m="${1//_/ }"
+  m="$(printf '%s' "$m" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  case "$(printf '%s' "$m" | tr 'A-Z' 'a-z')" in
+    ""|*android|*"android device"|*"mtp device"|mtp|"usb device") m="" ;;
+  esac
+  printf '%s' "$m"
+}
+
+# Строка product из sysfs первого USB-устройства известного производителя Android.
+android_usb_product() {
+  local dev vid
+  [ -d "$USB_SYSFS" ] || return 1
+  for dev in "$USB_SYSFS"/*; do
+    [ -r "$dev/idVendor" ] && [ -r "$dev/product" ] || continue
+    vid="$(tr 'A-Z' 'a-z' < "$dev/idVendor" 2>/dev/null)"
+    case " $ANDROID_VENDORS " in *" $vid "*) ;; *) continue ;; esac
+    head -n1 "$dev/product"
+    return 0
+  done
+  return 1
 }
 
 detect_android() {
@@ -260,6 +333,7 @@ detect_android() {
     D_ID="$host"
     D_MOUNT="$mount"
     D_NAME="$(mtp_name_for "$host")"
+    D_MODEL="$(clean_model "$(mtp_display_name "$host")")"
     local roots="" nstorage=0 s sub
     while IFS= read -r s; do
       [ -n "$s" ] || continue
@@ -282,7 +356,10 @@ detect_android() {
   elif [ -n "$uris" ]; then
     # Том виден gvfs, но смонтироваться не смог: обычно телефон заблокирован.
     D_STATE="locked"
-    D_NAME="$(mtp_name_for "$(printf '%s' "$(printf '%s\n' "$uris" | head -n1)" | sed 's#^mtp://##; s#/$##')")"
+    local uhost
+    uhost="$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')"
+    D_NAME="$(mtp_name_for "$uhost")"
+    D_MODEL="$(clean_model "$(mtp_display_name "$uhost")")"
     D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов»."
   elif [ "$usb" = 1 ] && [ "$backend" = 0 ]; then
     D_STATE="no-backend"
@@ -292,6 +369,10 @@ detect_android() {
     D_MSG="Телефон подключён только для зарядки. Откройте уведомление USB на телефоне и выберите «Передача файлов»."
   else
     D_STATE="absent"
+  fi
+  # MTP-имя не дало модель (или MTP ещё нет, режим зарядки): берём product из USB.
+  if [ "$D_STATE" != absent ] && [ -z "$D_MODEL" ]; then
+    D_MODEL="$(clean_model "$(android_usb_product || true)")"
   fi
 }
 

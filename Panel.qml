@@ -37,6 +37,7 @@ Panel {
   property string deviceMessage: ""
   property string deviceType: "none"       // iphone | android | none
   property string deviceName: ""
+  property string deviceModel: ""
   property var devices: []                 // все найденные телефоны (переключатель)
   property string preferredType: ""        // выбор пользователя, если подключены оба
   property string deviceKeyNow: ""         // тип-id для кэшей листинга и превью
@@ -50,6 +51,7 @@ Panel {
   // Поиск по содержимому есть только у iPhone (родной индекс Apple).
   readonly property bool isIphone: root.deviceType === "iphone"
   readonly property bool isAndroid: root.deviceType === "android"
+  readonly property string pillText: Model.pillLabel(root.deviceType, root.deviceModel)
   readonly property string deviceLabel: root.deviceType === "none" ? "Телефон" : Model.deviceTypeLabel(root.deviceType)
 
   // ---------- данные ----------
@@ -141,6 +143,7 @@ Panel {
     root.deviceMessage = String(d.message || "")
     root.deviceType = String(d.type || "none")
     root.deviceName = String(d.name || "")
+    root.deviceModel = String(d.model || "")
     root.devices = d.devices || []
     if (d.state === "ready") {
       var roots = d.roots || []
@@ -848,11 +851,15 @@ Panel {
       }
       Text {
         textFormat: Text.PlainText
-        text: root.deviceLabel
+        text: root.pillText
         color: Color.background
         font.family: root.fam
         font.pixelSize: Style.font.bodySmall
         font.bold: true
+        // Длинное имя не должно растягивать бар: ширина ограничена, хвост — «…».
+        elide: Text.ElideRight
+        Layout.maximumWidth: Style.space(180)
+        Layout.preferredWidth: Math.min(implicitWidth, Style.space(180))
         Layout.alignment: Qt.AlignVCenter
       }
       Rectangle {
