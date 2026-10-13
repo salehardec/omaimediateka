@@ -384,7 +384,9 @@ backoff_secs() {
 mtp_volume_key() {
   local uri dev
   uri="$(mtp_volume_uris | head -n1)"
-  dev="$(gio_list | sed -n "s/^[[:space:]]*unix-device: '\(.*\)'\$/\1/p" | head -n1)"
+  # unix-device именно того Volume, у которого activation_root=mtp:// (в выводе
+  # есть и диски со своими unix-device).
+  dev="$(gio_list | awk '/^[[:space:]]*Volume\(/ {d=""} /unix-device:/ {d=$0; sub(/^[^\x27]*\x27/, "", d); sub(/\x27.*$/, "", d)} /activation_root=mtp:\/\// {print d; exit}')"
   printf '%s|%s' "$uri" "$dev"
 }
 

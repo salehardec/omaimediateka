@@ -612,6 +612,24 @@ def t_backoff_grows_on_repeated_locked(e):
     assert_eq(seen, [30, 60, 120, 240, 300, 300], "паузы растут до 300 с")
 
 
+def t_connection_key_uses_the_mtp_volume_device(e):
+    e.install_mtp_backend()
+    drives = ("Drive(0): SSD\n  Type: GProxyDrive\nVolume(0): Disk\n  ids:\n"
+              "   unix-device: '/dev/nvme0n1'\n  activation_root=file:///\n")
+    vol = ("Volume(1): Pixel 7\n  ids:\n   unix-device: '/dev/bus/usb/005/%s'\n"
+           "  activation_root=mtp://Pixel_X/\n")
+    write(e.gio_list, drives + vol % "033")
+    e.at(1000)
+    e.status()
+    state = open(os.path.join(e.cache, "omaimediateka", "android-state", "android.state")).read()
+    assert "/dev/bus/usb/005/033" in state and "nvme0n1" not in state, state
+    # переподключение (новый номер устройства) — новая единственная попытка
+    write(e.gio_list, drives + vol % "034")
+    e.at(1100)
+    e.status()
+    assert_eq(len(open(e.gio_calls).read().split()), 2, "повторное подключение распознано")
+
+
 def t_force_overrides_backoff_but_is_throttled(e):
     e.install_mtp_backend()
     e.phone(storages=())
@@ -769,6 +787,7 @@ def main():
         ("model: нет устройства — пусто", t_model_empty_without_device),
         ("бэкофф ≥30 с: после locked к телефону не обращаемся", t_backoff_after_locked_no_device_access),
         ("бэкофф растёт при повторном locked до 300 с", t_backoff_grows_on_repeated_locked),
+        ("ключ подключения берётся от тома MTP, а не от дисков", t_connection_key_uses_the_mtp_volume_device),
         ("force обходит бэкофф, но не чаще 10 с", t_force_overrides_backoff_but_is_throttled),
         ("ready переиспользуется в пределах TTL без обращений", t_ready_state_reused_without_touching_phone),
         ("монтирование: одна попытка на подключение", t_mount_attempted_once_per_connection),
