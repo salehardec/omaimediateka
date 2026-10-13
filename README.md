@@ -105,7 +105,7 @@ computer if the phone asks.
 Sanity check:
 
 ```bash
-gio mount -l | grep -i mtp                                    # the phone is listed
+gio mount -li | grep -i mtp                                   # the phone is listed
 ls "$XDG_RUNTIME_DIR"/gvfs/mtp:host=*/*/                      # DCIM, Pictures, ...
 ```
 

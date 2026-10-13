@@ -80,7 +80,7 @@ sudo pacman -S gvfs-mtp
 Проверка:
 
 ```bash
-gio mount -l | grep -i mtp                                  # телефон в списке
+gio mount -li | grep -i mtp                                 # телефон в списке
 ls "$XDG_RUNTIME_DIR"/gvfs/mtp:host=*/*/                    # DCIM, Pictures, ...
 ```
 

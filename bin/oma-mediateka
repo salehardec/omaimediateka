@@ -251,10 +251,10 @@ android_usb_present() {
   return 1
 }
 
-# Вывод `gio mount -l` (один вызов на status).
+# Вывод `gio mount -li` (один вызов на status; activation_root есть только с -i).
 GIO_LIST=""
 gio_list() {
-  [ -n "$GIO_LIST" ] || GIO_LIST="$(timeout 5 gio mount -l 2>/dev/null || true)"
+  [ -n "$GIO_LIST" ] || GIO_LIST="$(timeout 5 gio mount -li 2>/dev/null || true)"
   printf '%s\n' "$GIO_LIST"
 }
 
@@ -267,18 +267,29 @@ mtp_volume_uris() {
 mtp_display_name() {
   local host="$1" name re
   re="$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')"
-  name="$(gio_list | sed -n "s/^Mount([0-9]*): \(.*\) -> mtp:\/\/$re\/\$/\1/p" | head -n1)"
+  # Под одним host gvfs показывает два Mount (теневой с именем телефона и «mtp»).
+  name="$(gio_list | sed -n "s/^[[:space:]]*Mount([0-9]*): \(.*\) -> mtp:\/\/$re\/\$/\1/p" | grep -vix mtp | head -n1)"
   if [ -z "$name" ]; then
     name="$(gio_list | sed -n "s/^Volume([0-9]*): \(.*\)\$/\1/p" | head -n1)"
   fi
   printf '%s' "$name"
 }
 
-mtp_name_for() {
-  local name
-  name="$(mtp_display_name "$1")"
-  [ -n "$name" ] || name="${1//_/ }"
-  printf '%s' "${name:-Android}"
+# Имя, которое телефон сообщает по MTP (`gio info`): «Pixel 8», «Galaxy S9+ пользователя
+# Имя». Работает только для смонтированного тома. Хвост с именем владельца отсекается.
+mtp_info_name() {
+  local n
+  n="$(timeout 5 gio info -a standard::display-name "mtp://$1/" 2>/dev/null | sed -n 's/^display name: //p' | head -n1)"
+  printf '%s' "$n" | sed -E 's/ пользователя .*$//; s/ of .*$//'
+}
+
+# Модель телефона: имя из `gio info`, иначе из списка gvfs. Общие слова
+# («SAMSUNG Android», «mtp») модели не считаются.
+android_model() {
+  local m
+  m="$(clean_model "$(mtp_info_name "$1")")"
+  [ -n "$m" ] || m="$(clean_model "$(mtp_display_name "$1")")"
+  printf '%s' "$m"
 }
 
 # Модель из MTP-имени gvfs («Pixel 8»); пусто, если там только общее слово.
@@ -332,8 +343,8 @@ detect_android() {
     host="${host#mtp:host=}"
     D_ID="$host"
     D_MOUNT="$mount"
-    D_NAME="$(mtp_name_for "$host")"
-    D_MODEL="$(clean_model "$(mtp_display_name "$host")")"
+    D_MODEL="$(android_model "$host")"
+    D_NAME="${D_MODEL:-Android}"
     local roots="" nstorage=0 s sub
     while IFS= read -r s; do
       [ -n "$s" ] || continue
@@ -358,8 +369,8 @@ detect_android() {
     D_STATE="locked"
     local uhost
     uhost="$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')"
-    D_NAME="$(mtp_name_for "$uhost")"
     D_MODEL="$(clean_model "$(mtp_display_name "$uhost")")"
+    D_NAME="${D_MODEL:-Android}"
     D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов»."
   elif [ "$usb" = 1 ] && [ "$backend" = 0 ]; then
     D_STATE="no-backend"

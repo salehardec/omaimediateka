@@ -58,6 +58,7 @@ class Env:
         self.gio_list = os.path.join(self.root, "gio-list.txt")
         self.gio_mount_action = os.path.join(self.root, "gio-mount-action.sh")
         self.gio_calls = os.path.join(self.root, "gio.calls")
+        self.gio_info = os.path.join(self.root, "gio-info.txt")
         self.gio_bad = os.path.join(self.root, "gio.bad")
         self.udids = os.path.join(self.root, "udids.txt")
         write(self.gio_list, "")
@@ -65,11 +66,12 @@ class Env:
         # gio: `mount -l` печатает заготовку, `mount <uri>` выполняет действие.
         write(os.path.join(self.bin, "gio"),
               '#!/bin/sh\n'
-              'if [ "$1" = mount ] && [ "$2" = -l ]; then cat "%s"; exit 0; fi\n'
+              'if [ "$1" = mount ] && [ "$2" = -li ]; then cat "%s"; exit 0; fi\n'
+              'if [ "$1" = info ]; then [ -s "%s" ] && cat "%s"; exit 0; fi\n'
               'if [ "$1" = mount ]; then echo "$2" >> "%s"; '
               '[ -f "%s" ] && . "%s"; [ -f "%s" ]; exit $?; fi\n'
               'echo "unexpected gio $*" >> "%s"; exit 1\n'
-              % (self.gio_list, self.gio_calls, self.gio_mount_action,
+              % (self.gio_list, self.gio_info, self.gio_info, self.gio_calls, self.gio_mount_action,
                  self.gio_mount_action, self.gio_mount_action, self.gio_bad),
               0o755)
         write(os.path.join(self.bin, "idevice_id"),
@@ -195,7 +197,7 @@ def t_android_sd_card(e):
         mount + "/SD card/Pictures",
     ], "roots")
     # без строки Mount(...) имя берётся из host
-    assert_eq(s["name"], "Google Pixel 7 ABC123", "name из host")
+    assert_eq((s["name"], s["model"]), ("Android", ""), "без имени от телефона — общее «Android»")
 
 
 def t_android_locked(e):
@@ -488,6 +490,18 @@ def t_model_android_from_mtp_name(e):
     assert_eq(e.status()["model"], "Pixel 8", "model")
 
 
+def t_model_android_from_gio_info_display_name(e):
+    # Реальный случай: два Mount в gio, один общий «mtp»; имя — из `gio info`,
+    # без хвоста с именем владельца.
+    e.install_mtp_backend()
+    host = "SAMSUNG_SAMSUNG_Android_2a3c"
+    e.phone(host=host)
+    write(e.gio_list, "Mount(0): SAMSUNG Android -> mtp://%s/\nMount(1): mtp -> mtp://%s/\n" % (host, host))
+    write(e.gio_info, "display name: Galaxy S9+ пользователя Алексей\nname: %s\n" % host)
+    s = e.status()
+    assert_eq((s["model"], s["name"]), ("Galaxy S9+", "Galaxy S9+"), "model/name")
+
+
 def t_model_android_generic_name_uses_usb_product(e):
     e.install_mtp_backend()
     e.phone(host="SAMSUNG_SAMSUNG_Android_R58")
@@ -508,7 +522,7 @@ def t_model_android_unknown_is_empty(e):
     e.phone(host="Some_Phone")
     s = e.status()
     assert_eq(s["model"], "", "модели нет — пусто, имя остаётся запасным")
-    assert_eq(s["name"], "Some Phone", "name")
+    assert_eq(s["name"], "Android", "name")
 
 
 def t_model_iphone_marketing_name(e):
@@ -554,6 +568,7 @@ def main():
         ("status: оба подключены — готовое устройство первым", t_both_prefers_ready_one),
         ("status: запрошенного устройства нет — запасной показ", t_prefer_missing_device_falls_back),
         ("model: Android из MTP-имени", t_model_android_from_mtp_name),
+        ("model: Android из gio info без имени владельца", t_model_android_from_gio_info_display_name),
         ("model: общее MTP-имя → USB product", t_model_android_generic_name_uses_usb_product),
         ("model: Android в режиме зарядки — из USB", t_model_android_charge_only_from_usb),
         ("model: Android без модели — пусто", t_model_android_unknown_is_empty),
