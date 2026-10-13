@@ -116,11 +116,14 @@ Panel {
   }
 
   // ---------- статус устройства ----------
-  function refreshStatus() {
+  // force — явная просьба пользователя («Проверить снова»): хелпер повторит
+  // попытку к Android мимо бэкоффа (но не чаще раза в 10 с). Автоопрос force не шлёт.
+  function refreshStatus(force) {
     if (statusProc.running) { root.statusQueued = true; return }
-    statusProc.command = root.preferredType !== ""
-      ? [root.helper, "status", root.preferredType]
-      : [root.helper, "status"]
+    var cmd = [root.helper, "status"]
+    if (root.preferredType !== "") cmd.push(root.preferredType)
+    if (force === true) cmd.push("--force")
+    statusProc.command = cmd
     statusProc.running = true
   }
 
@@ -785,7 +788,9 @@ Panel {
   // ---------- таймер опроса ----------
   Timer {
     id: pollTimer
-    interval: root.opened ? 2500 : 6000
+    // Android по MTP опрашиваем редко: телефон не любит частых обращений (сам хелпер
+    // ещё и держит бэкофф и кэш). iPhone и «нет устройства» — как раньше.
+    interval: root.isAndroid ? (root.opened ? 15000 : 30000) : (root.opened ? 2500 : 6000)
     repeat: true
     running: true
     onTriggered: root.refreshStatus()
@@ -1063,7 +1068,7 @@ Panel {
               fontSize: Style.font.bodySmall
               horizontalPadding: Style.space(12)
               verticalPadding: Style.space(6)
-              onClicked: root.refreshStatus()
+              onClicked: root.refreshStatus(true)
             }
             Item { Layout.fillHeight: true }
           }

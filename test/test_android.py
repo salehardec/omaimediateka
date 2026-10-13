@@ -4,6 +4,7 @@
 # gvfs, libimobiledevice и pacman подменяются заглушками в PATH, USB — каталогом
 # в духе /sys/bus/usb/devices. Запуск: python3 test/test_android.py
 
+import fcntl
 import json
 import os
 import shutil
@@ -64,16 +65,22 @@ class Env:
         write(self.gio_list, "")
         write(self.udids, "")
         # gio: `mount -l` печатает заготовку, `mount <uri>` выполняет действие.
+        self.touch = os.path.join(self.root, "touch.log")
+        self.lock = os.path.join(self.root, "mtp.lock")
+        # «Обращения к телефону» (touch.log): монтирование, gio info, find по mtp-тому.
         write(os.path.join(self.bin, "gio"),
               '#!/bin/sh\n'
-              'if [ "$1" = mount ] && [ "$2" = -li ]; then cat "%s"; exit 0; fi\n'
-              'if [ "$1" = info ]; then [ -s "%s" ] && cat "%s"; exit 0; fi\n'
-              'if [ "$1" = mount ]; then echo "$2" >> "%s"; '
-              '[ -f "%s" ] && . "%s"; [ -f "%s" ]; exit $?; fi\n'
-              'echo "unexpected gio $*" >> "%s"; exit 1\n'
-              % (self.gio_list, self.gio_info, self.gio_info, self.gio_calls, self.gio_mount_action,
-                 self.gio_mount_action, self.gio_mount_action, self.gio_bad),
+              'if [ "$1" = mount ] && [ "$2" = -li ]; then cat "%(list)s"; exit 0; fi\n'
+              'if [ "$1" = info ]; then echo info >> "%(touch)s"; [ -s "%(info)s" ] && cat "%(info)s"; exit 0; fi\n'
+              'if [ "$1" = mount ]; then echo "$2" >> "%(calls)s"; echo mount >> "%(touch)s"; '
+              '[ -f "%(action)s" ] && . "%(action)s"; [ -f "%(action)s" ]; exit $?; fi\n'
+              'echo "unexpected gio $*" >> "%(bad)s"; exit 1\n'
+              % dict(list=self.gio_list, touch=self.touch, info=self.gio_info,
+                     calls=self.gio_calls, action=self.gio_mount_action, bad=self.gio_bad),
               0o755)
+        write(os.path.join(self.bin, "find"),
+              '#!/bin/sh\ncase "$*" in *mtp:host=*) echo find >> "%s";; esac\n'
+              'exec /usr/bin/find "$@"\n' % self.touch, 0o755)
         write(os.path.join(self.bin, "idevice_id"),
               '#!/bin/sh\ncat "%s"\n' % self.udids, 0o755)
         self.product_type = os.path.join(self.root, "product-type.txt")
@@ -89,7 +96,17 @@ class Env:
             PATH=self.bin + ":/usr/bin:/bin",
             OMA_USB_SYSFS=self.usb,
             OMA_GVFS_LIBDIRS=self.libs,
+            OMA_MTP_LOCK=self.lock,
+            OMA_NOW="1000",
         )
+
+    def at(self, t):
+        self.env["OMA_NOW"] = str(t)
+
+    def touches(self):
+        if not os.path.exists(self.touch):
+            return 0
+        return len(open(self.touch).read().split())
 
     def close(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -550,6 +567,164 @@ def t_model_empty_without_device(e):
     assert_eq(e.status()["model"], "", "model")
 
 
+# --- бережное обращение с MTP: бэкофф, одна попытка, лок --------------------
+
+def t_backoff_after_locked_no_device_access(e):
+    e.install_mtp_backend()
+    e.phone(storages=())  # том пуст: «Get Storage information failed»
+    e.at(1000)
+    s = e.status()
+    assert_eq(s["state"], "locked", "state")
+    first = e.touches()
+    assert first > 0, "первая проверка обращается к тому"
+    for t in (1005, 1015, 1029):  # внутри бэкоффа 30 с
+        e.at(t)
+        s = e.status()
+        assert_eq(s["state"], "locked", "state при t=%d" % t)
+        assert_eq(e.touches(), first, "к телефону нельзя обращаться при t=%d" % t)
+    # бэкофф не короче 30 с
+    state = open(os.path.join(e.cache, "omaimediateka", "android-state", "android.state")).read()
+    fields = dict(l.split("=", 1) for l in state.splitlines() if l.startswith(("S_TS=", "S_UNTIL=")))
+    assert int(fields["S_UNTIL"]) - int(fields["S_TS"]) >= 30, fields
+    # после бэкоффа — одна новая проверка
+    e.at(1031)
+    e.status()
+    second = e.touches()
+    assert second > first, "после бэкоффа проверка повторяется"
+    e.at(1032)
+    e.status()
+    assert_eq(e.touches(), second, "и снова пауза")
+
+
+def t_force_overrides_backoff_but_is_throttled(e):
+    e.install_mtp_backend()
+    e.phone(storages=())
+    e.at(1000)
+    e.status()
+    base = e.touches()
+    e.at(1004)  # слишком скоро даже для явного запроса (минимум 10 с)
+    e.status("--force")
+    assert_eq(e.touches(), base, "force чаще 10 с игнорируется")
+    e.at(1012)
+    e.status("--force")
+    assert e.touches() > base, "явный запрос проходит мимо бэкоффа"
+
+
+def t_ready_state_reused_without_touching_phone(e):
+    e.install_mtp_backend()
+    e.phone(files=MEDIA)
+    e.at(1000)
+    s = e.status()
+    assert_eq(s["state"], "ready", "state")
+    base = e.touches()
+    e.at(1030)
+    s2 = e.status()
+    assert_eq(s2["state"], "ready", "state из кэша")
+    assert_eq(s2["roots"], s["roots"], "roots из кэша")
+    assert_eq(e.touches(), base, "в пределах TTL телефон не трогаем")
+    e.at(1061)
+    e.status()
+    assert e.touches() > base, "после TTL — одна проверка"
+
+
+def t_mount_attempted_once_per_connection(e):
+    e.install_mtp_backend()
+    vol = ("Volume(0): Pixel 7\n  ids:\n   unix-device: '/dev/bus/usb/005/%s'\n"
+           "  activation_root=mtp://Pixel_X/\n")
+    write(e.gio_list, vol % "033")
+
+    def mounts():
+        return open(e.gio_calls).read().split() if os.path.exists(e.gio_calls) else []
+
+    e.at(1000)
+    assert_eq(e.status()["state"], "locked", "state")
+    assert_eq(len(mounts()), 1, "первая попытка монтирования")
+    for t in (1100, 1300, 5000):  # бэкофф давно прошёл, но подключение то же
+        e.at(t)
+        s = e.status()
+        assert_eq(s["state"], "locked", "state")
+        assert_eq(len(mounts()), 1, "повторно не монтируем (t=%d)" % t)
+    assert "Проверить снова" in s["message"], s["message"]
+    e.at(6000)
+    e.status("--force")
+    assert_eq(len(mounts()), 2, "force монтирует явно")
+    write(e.gio_list, vol % "034")  # переподключение: другой номер USB-устройства
+    e.at(7000)
+    e.status()
+    assert_eq(len(mounts()), 3, "новое подключение — одна попытка")
+    e.at(8000)
+    e.status()
+    assert_eq(len(mounts()), 3, "и больше не повторяет")
+
+
+def t_status_does_not_wait_for_busy_lock(e):
+    e.install_mtp_backend()
+    e.phone(files=MEDIA)
+    e.at(1000)
+    ready = e.status()
+    assert_eq(ready["state"], "ready", "state")
+    base = e.touches()
+    fd = os.open(e.lock, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # другой процесс держит телефон
+    try:
+        e.at(5000)  # TTL давно вышел — без лока была бы новая проверка
+        t0 = time.time()
+        busy = e.status()
+        assert time.time() - t0 < 5, "status не ждёт лок"
+        assert_eq(busy["state"], "ready", "последнее известное состояние")
+        assert_eq(busy["roots"], ready["roots"], "roots")
+        assert_eq(e.touches(), base, "к занятому телефону не обращаемся")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    e.at(5001)
+    e.status()
+    assert e.touches() > base, "после освобождения лока проверка проходит"
+
+
+def t_status_busy_lock_without_cache_says_checking(e):
+    e.install_mtp_backend()
+    e.phone(files=MEDIA)
+    fd = os.open(e.lock, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        s = e.status()
+        assert_eq(s["state"], "mounting", "state")
+        assert_eq(s["type"], "android", "type")
+        assert_eq(e.touches(), 0, "телефон не тронут")
+    finally:
+        os.close(fd)
+
+
+def t_data_commands_queue_on_device_lock(e):
+    e.install_mtp_backend()
+    mount = e.phone(files=MEDIA)
+    st = mount + "/Internal shared storage"
+    local = os.path.join(e.root, "local")
+    write(os.path.join(local, "DCIM", "a.jpg"), "x")
+    fd = os.open(e.lock, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    e.env["OMA_MTP_LOCK_WAIT"] = "1"
+    try:
+        p = e.helper("list", st + "/DCIM")
+        assert_eq(p.returncode, 98, "list по MTP ждёт очередь и сдаётся")
+        p = e.helper("meta", st + "/DCIM/Camera/PXL_20261013_093000123.jpg")
+        assert_eq(p.returncode, 98, "meta по MTP тоже в очереди")
+        p = e.helper("list", os.path.join(local, "DCIM"))  # не-MTP лок не касается
+        assert_eq(p.returncode, 0, "локальный list")
+        assert "a.jpg" in p.stdout, p.stdout
+        dst = os.path.join(e.root, "cached.jpg")  # превью в кэше — без телефона и лока
+        write(dst, "jpeg")
+        p = e.helper("thumb", st + "/DCIM/Camera/PXL_20261013_093000123.jpg", dst, "photo")
+        assert_eq(p.returncode, 0, "кэш-хит thumb")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    p = e.helper("list", st + "/DCIM")
+    assert_eq(p.returncode, 0, "после освобождения лока list проходит")
+    assert "PXL_20261013_093000123.jpg" in p.stdout, p.stdout
+
+
 def main():
     cases = [
         ("status: нет устройства", t_no_device),
@@ -576,6 +751,13 @@ def main():
         ("model: неизвестный ProductType остаётся как есть", t_model_iphone_unknown_product_type_kept),
         ("model: iPhone без ideviceinfo-ответа — пусто", t_model_iphone_unavailable_is_empty),
         ("model: нет устройства — пусто", t_model_empty_without_device),
+        ("бэкофф ≥30 с: после locked к телефону не обращаемся", t_backoff_after_locked_no_device_access),
+        ("force обходит бэкофф, но не чаще 10 с", t_force_overrides_backoff_but_is_throttled),
+        ("ready переиспользуется в пределах TTL без обращений", t_ready_state_reused_without_touching_phone),
+        ("монтирование: одна попытка на подключение", t_mount_attempted_once_per_connection),
+        ("лок: status не ждёт занятый телефон, отдаёт кэш", t_status_does_not_wait_for_busy_lock),
+        ("лок: нет кэша и занято → «проверяю», телефон не тронут", t_status_busy_lock_without_cache_says_checking),
+        ("лок: list/meta по MTP стоят в очереди, кэш thumb — нет", t_data_commands_queue_on_device_lock),
         ("list: несколько корней, скрытое и не-медиа отброшено", t_list_android_roots),
         ("list: пустой каталог и usage", t_list_missing_dir_is_empty),
         ("list --cache / list-cached: кэш листинга", t_list_cache),

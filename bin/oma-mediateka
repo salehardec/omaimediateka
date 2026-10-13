@@ -7,7 +7,9 @@
 # подключении кабеля. На телефонах только читаем: ни записи, ни удаления.
 #
 # Подкоманды:
-#   status [iphone|android]     — состояние устройства одной JSON-строкой
+#   status [iphone|android] [--force]
+#                               — состояние устройства одной JSON-строкой (--force:
+#                                 явная повторная попытка к Android, мимо бэкоффа)
 #   list [--cache KEY] <dir>... — TSV листинг медиафайлов (mtime, size, path)
 #   list-cached <KEY>           — последний сохранённый листинг (код 1, если нет)
 #   thumb <src> <dst> <kind> [variant]
@@ -103,10 +105,11 @@ find_afc_mount() {
 }
 
 # Каталог монтирования MTP (любой первый).
+# Только имена из каталога gvfs (readdir), без обращения к самому телефону.
 find_mtp_mount() {
   local d
   for d in "$GVFS_DIR"/mtp:host=*; do
-    [ -d "$d" ] || continue
+    [ "${d##*=}" = "*" ] && continue
     printf '%s' "$d"
     return 0
   done
@@ -316,25 +319,118 @@ android_usb_product() {
   return 1
 }
 
-detect_android() {
+# --- Android: бережное обращение с MTP -------------------------------------
+#
+# MTP-сессия телефона хрупкая: частые повторные открытия/монтирования при
+# заблокированном экране («Get Storage information failed») могут повесить
+# телефон. Поэтому:
+#   * status НЕ монтирует том при каждом опросе: одна попытка на подключение
+#     (ключ — USB-устройство тома), дальше только проверка уже смонтированного
+#     пути; повтор — явным `status --force` (кнопка «Проверить снова»);
+#   * после неудачи/пустого тома — бэкофф MTP_BACKOFF с (по умолчанию 30) без
+#     единого обращения к устройству, ответ берётся из кэша состояния;
+#   * готовое состояние переиспользуется MTP_READY_TTL с;
+#   * один процесс на устройство: flock; status не ждёт (занято — отдаёт кэш),
+#     а list/thumb/meta/copy по MTP-пути ждут своей очереди.
+
+MTP_LOCK="${OMA_MTP_LOCK:-$RUNTIME/omaimediateka-mtp.lock}"
+MTP_STATE="$CACHE_DIR/android-state/android.state"
+MTP_BACKOFF="${OMA_MTP_BACKOFF:-30}"
+MTP_READY_TTL="${OMA_MTP_READY_TTL:-60}"
+MTP_FORCE_MIN="${OMA_MTP_FORCE_MIN:-10}"
+FORCE=0
+
+now() { printf '%s' "${OMA_NOW:-$(date +%s)}"; }
+
+android_state_load() {
+  S_TS=0; S_UNTIL=0; S_KEY=""; S_ATTEMPT=""
+  S_STATE=""; S_BACKEND=""; S_NAME=""; S_MODEL=""; S_ID=""; S_MOUNT=""; S_ROOTS=""; S_MSG=""
+  # shellcheck disable=SC1090
+  [ -f "$MTP_STATE" ] && . "$MTP_STATE" 2>/dev/null
+  return 0
+}
+
+android_state_save() {
+  mkdir -p "$(dirname "$MTP_STATE")" 2>/dev/null || return 0
+  local tmp v ref
+  tmp="$(mktemp "$MTP_STATE.XXXXXX")" || return 0
+  {
+    printf 'S_TS=%q\nS_UNTIL=%q\nS_KEY=%q\nS_ATTEMPT=%q\n' "$(now)" "$NEW_UNTIL" "$NEW_KEY" "$NEW_ATTEMPT"
+    for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
+      ref="D_$v"
+      printf 'S_%s=%q\n' "$v" "${!ref}"
+    done
+  } > "$tmp"
+  mv -f "$tmp" "$MTP_STATE"
+}
+
+android_state_apply() {
+  local v ref
+  for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
+    ref="S_$v"
+    declare -g "D_$v=${!ref}"
+  done
+}
+
+# Ключ подключения: USB-устройство тома (меняется при переподключении).
+mtp_volume_key() {
+  local uri dev
+  uri="$(mtp_volume_uris | head -n1)"
+  dev="$(gio_list | sed -n "s/^[[:space:]]*unix-device: '\(.*\)'\$/\1/p" | head -n1)"
+  printf '%s|%s' "$uri" "$dev"
+}
+
+# Зондирование под локом. Выставляет D_*, NEW_UNTIL/NEW_KEY/NEW_ATTEMPT и
+# REUSED=1, если ответ целиком взят из кэша (тогда файл состояния не трогаем).
+probe_android() {
   reset_dev
   D_NAME="Android"
-  local mount usb=0 backend=0
+  local t usb=0 backend=0 mount force_ok=0
+  t="$(now)"
+  android_state_load
+  NEW_UNTIL=0; NEW_KEY=""; NEW_ATTEMPT="$S_ATTEMPT"; REUSED=0
+
   android_usb_present && usb=1
-  mount="$(find_mtp_mount || true)"
   have_gvfs_backend gvfsd-mtp gvfs-mtp && backend=1
+  mount="$(find_mtp_mount || true)"
   [ -n "$mount" ] && backend=1
   [ "$backend" = 1 ] && D_BACKEND="gvfs"
+  if [ "$FORCE" = 1 ] && [ $((t - S_TS)) -ge "$MTP_FORCE_MIN" ]; then force_ok=1; fi
 
-  local uris=""
-  if [ -z "$mount" ] && [ "$backend" = 1 ]; then
+  local uris="" key=""
+  if [ -n "$mount" ]; then
+    key="$mount"
+  elif [ "$backend" = 1 ]; then
     uris="$(mtp_volume_uris)"
-    local u
-    while IFS= read -r u; do
-      [ -n "$u" ] || continue
-      timeout 15 gio mount "$u" >/dev/null 2>&1 || true
-    done <<< "$uris"
-    mount="$(find_mtp_mount || true)"
+    [ -n "$uris" ] && key="$(mtp_volume_key)"
+  fi
+
+  # Кэш: готовое — на TTL, неудача/пустой том — на время бэкоффа. К устройству
+  # не обращаемся вовсе.
+  if [ -n "$key" ] && [ "$S_KEY" = "$key" ] && [ -n "$S_STATE" ] && [ "$force_ok" = 0 ] \
+     && [ "$t" -lt "$S_UNTIL" ]; then
+    android_state_apply
+    NEW_UNTIL="$S_UNTIL"; NEW_KEY="$S_KEY"; REUSED=1
+    return 0
+  fi
+
+  if [ -z "$mount" ] && [ -n "$uris" ]; then
+    # Том виден, но не смонтирован: одна попытка на подключение (или явная).
+    if [ "$key" != "$S_ATTEMPT" ] || [ "$force_ok" = 1 ]; then
+      NEW_ATTEMPT="$key"
+      timeout 15 gio mount "$(printf '%s\n' "$uris" | head -n1)" >/dev/null 2>&1 || true
+      mount="$(find_mtp_mount || true)"
+    fi
+    if [ -z "$mount" ]; then
+      D_STATE="locked"
+      D_MODEL="$(clean_model "$(mtp_display_name "$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')")")"
+      D_NAME="${D_MODEL:-Android}"
+      D_MSG="Разблокируйте телефон и выберите «Передача файлов», затем нажмите «Проверить снова»."
+      NEW_UNTIL=$((t + MTP_BACKOFF)); NEW_KEY="$key"
+      [ -n "$D_MODEL" ] || D_MODEL="$(clean_model "$(android_usb_product || true)")"
+      return 0
+    fi
+    key="$mount"
   fi
 
   if [ -n "$mount" ]; then
@@ -343,7 +439,11 @@ detect_android() {
     host="${host#mtp:host=}"
     D_ID="$host"
     D_MOUNT="$mount"
-    D_MODEL="$(android_model "$host")"
+    if [ "$S_MOUNT" = "$mount" ] && [ -n "$S_MODEL" ]; then
+      D_MODEL="$S_MODEL"
+    else
+      D_MODEL="$(android_model "$host")"
+    fi
     D_NAME="${D_MODEL:-Android}"
     local roots="" nstorage=0 s sub
     while IFS= read -r s; do
@@ -355,36 +455,77 @@ detect_android() {
       done
     done < <(timeout 10 find "$mount" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
     D_ROOTS="$roots"
+    NEW_KEY="$mount"
     if [ -n "$roots" ]; then
       D_STATE="ready"
+      NEW_UNTIL=$((t + MTP_READY_TTL))
     elif [ "$nstorage" -gt 0 ]; then
       D_STATE="no-dcim"
       D_MSG="В памяти телефона нет папок DCIM и Pictures."
+      NEW_UNTIL=$((t + MTP_READY_TTL))
     else
+      # Том пуст: телефон заблокирован или не отдаёт хранилище. Не дёргаем.
       D_STATE="locked"
-      D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов»."
+      D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов», затем нажмите «Проверить снова»."
+      NEW_UNTIL=$((t + MTP_BACKOFF))
     fi
-  elif [ -n "$uris" ]; then
-    # Том виден gvfs, но смонтироваться не смог: обычно телефон заблокирован.
-    D_STATE="locked"
-    local uhost
-    uhost="$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')"
-    D_MODEL="$(clean_model "$(mtp_display_name "$uhost")")"
-    D_NAME="${D_MODEL:-Android}"
-    D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов»."
   elif [ "$usb" = 1 ] && [ "$backend" = 0 ]; then
     D_STATE="no-backend"
     D_MSG="Нет доступа к файлам Android. Установите: sudo pacman -S gvfs-mtp"
+    NEW_ATTEMPT=""
   elif [ "$usb" = 1 ]; then
     D_STATE="charge-only"
     D_MSG="Телефон подключён только для зарядки. Откройте уведомление USB на телефоне и выберите «Передача файлов»."
+    NEW_ATTEMPT=""
   else
     D_STATE="absent"
+    NEW_ATTEMPT=""
   fi
   # MTP-имя не дало модель (или MTP ещё нет, режим зарядки): берём product из USB.
   if [ "$D_STATE" != absent ] && [ -z "$D_MODEL" ]; then
     D_MODEL="$(clean_model "$(android_usb_product || true)")"
   fi
+}
+
+detect_android() {
+  reset_dev
+  D_NAME="Android"
+  mkdir -p "$(dirname "$MTP_LOCK")" 2>/dev/null
+  local rc
+  (
+    flock -n 9 || exit 99
+    probe_android
+    [ "$REUSED" = 1 ] || android_state_save
+  ) 9>"$MTP_LOCK"
+  rc=$?
+  android_state_load
+  if [ "$rc" = 99 ]; then
+    # Устройство занято другим процессом (листинг, превью, чужой status):
+    # к нему не лезем, отдаём последнее известное, если том тот же.
+    local cur
+    cur="$(find_mtp_mount || true)"
+    if [ -n "$S_STATE" ] && [ "$S_MOUNT" = "$cur" ]; then
+      android_state_apply
+    else
+      D_STATE="mounting"
+      D_BACKEND="gvfs"
+      D_MSG="Телефон занят другой операцией, проверяю…"
+    fi
+  else
+    android_state_apply
+  fi
+  [ -n "$D_NAME" ] || D_NAME="Android"
+}
+
+# Команды с данными телефона по MTP-пути идут по одной (общий лок с status).
+mtp_locked() {
+  local p="$1"; shift
+  case "$p" in */mtp:host=*) ;; *) "$@"; return $? ;; esac
+  mkdir -p "$(dirname "$MTP_LOCK")" 2>/dev/null
+  (
+    flock -w "${OMA_MTP_LOCK_WAIT:-300}" 9 || exit 98
+    "$@"
+  ) 9>"$MTP_LOCK"
 }
 
 # --- status ----------------------------------------------------------------
@@ -393,7 +534,13 @@ detect_android() {
 # `devices` перечисляет все найденные телефоны. Если подключены оба, показывается
 # запрошенный тип, иначе первый готовый (iPhone раньше Android).
 cmd_status() {
-  local prefer="${1:-}"
+  local prefer="" a
+  for a in "$@"; do
+    case "$a" in
+      --force) FORCE=1 ;;
+      iphone|android) prefer="$a" ;;
+    esac
+  done
   detect_iphone; save_dev IPH
   detect_android; save_dev AND
 
@@ -668,13 +815,18 @@ cmd_search() {
 
 case "${1:-}" in
   status) shift; cmd_status "$@" ;;
-  list)   shift; cmd_list "$@" ;;
+  list)   shift
+          lp=""
+          for a in "$@"; do case "$a" in /*) lp="$a"; break ;; esac; done
+          mtp_locked "$lp" cmd_list "$@" ;;
   list-cached) shift; cmd_list_cached "$@" ;;
-  thumb)  shift; cmd_thumb "$@" ;;
-  meta)   shift; cmd_meta "$@" ;;
+  thumb)  shift
+          [ -s "${2:-}" ] && exit 0   # уже в кэше — телефон не нужен
+          mtp_locked "${1:-}" cmd_thumb "$@" ;;
+  meta)   shift; mtp_locked "${1:-}" cmd_meta "$@" ;;
   names)  shift; cmd_names "$@" ;;
-  copy)   shift; cmd_copy "$@" ;;
-  clip-image) shift; cmd_clip_image "$@" ;;
+  copy)   shift; mtp_locked "${1:-}" cmd_copy "$@" ;;
+  clip-image) shift; mtp_locked "${1:-}" cmd_clip_image "$@" ;;
   clip-text)  shift; cmd_clip_text "$@" ;;
   pick-dir)   shift; cmd_pick_dir "$@" ;;
   index)      shift; cmd_index "$@" ;;
@@ -682,7 +834,7 @@ case "${1:-}" in
   *)
     cat >&2 <<'USAGE'
 usage: oma-mediateka <command> [args]
-  status [iphone|android]
+  status [iphone|android] [--force]
   list [--cache KEY] <dir>...
   list-cached <KEY>
   thumb <src> <dst> <kind> [thumb|preview]
