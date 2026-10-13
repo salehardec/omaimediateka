@@ -44,5 +44,6 @@ echo "2) Перезапустите шелл: omarchy restart shell"
 echo
 echo "Системная подготовка (один раз, с sudo):"
 echo "     sudo pacman -S gvfs-afc"
+echo "     sudo pacman -S gvfs-mtp        # для Android (MTP)"
 echo "     sudo systemctl start usbmuxd   # обычно службу поднимает udev при подключении"
-echo "Затем подключите iPhone кабелем и нажмите «Доверять» на телефоне."
+echo "Затем подключите телефон кабелем: iPhone — нажмите «Доверять», Android — выберите режим «Передача файлов» (нужен gvfs-mtp)."

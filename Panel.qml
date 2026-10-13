@@ -7,9 +7,10 @@ import qs.Commons
 import qs.Ui
 import "MediaModel.js" as Model
 
-// Медиатека iPhone по USB. Кнопка в баре -> попап по центру экрана:
-// сетка превью из DCIM, фильтр, полноэкранный просмотр выбранного.
-// Только просмотр: без импорта, удаления и прочих файлов.
+// Медиатека телефона (iPhone или Android) по USB. Кнопка в баре -> попап по
+// центру экрана: сетка превью из DCIM (у Android ещё Pictures), фильтр,
+// полноэкранный просмотр выбранного. Только чтение с телефона: без импорта и
+// удаления. Про пути устройств знает только bin/oma-mediateka.
 Panel {
   id: root
 
@@ -31,11 +32,25 @@ Panel {
   readonly property string fam: Style.font.family
 
   // ---------- состояние устройства ----------
-  property var device: ({ state: "unknown", backend: "none", udid: "", mount: "", dcim: "", message: "" })
+  property var device: ({ state: "unknown", backend: "none", type: "none", name: "", id: "", udid: "", mount: "", dcim: "", roots: [], devices: [], message: "" })
   property string deviceState: "unknown"
   property string deviceMessage: ""
-  property string currentDcim: ""
+  property string deviceType: "none"       // iphone | android | none
+  property string deviceName: ""
+  property var devices: []                 // все найденные телефоны (переключатель)
+  property string preferredType: ""        // выбор пользователя, если подключены оба
+  property string deviceKeyNow: ""         // тип-id для кэшей листинга и превью
+  property var currentRoots: []
+  property string currentRootsKey: ""
   property bool scanning: false
+  property bool listFresh: false           // свежий обход уже применён
+  property bool listQueued: false
+  property string listDeviceKey: ""
+  property bool statusQueued: false
+  // Поиск по содержимому есть только у iPhone (родной индекс Apple).
+  readonly property bool isIphone: root.deviceType === "iphone"
+  readonly property bool isAndroid: root.deviceType === "android"
+  readonly property string deviceLabel: root.deviceType === "none" ? "Телефон" : Model.deviceTypeLabel(root.deviceType)
 
   // ---------- данные ----------
   property var items: []
@@ -100,9 +115,18 @@ Panel {
 
   // ---------- статус устройства ----------
   function refreshStatus() {
-    if (statusProc.running) return
-    statusProc.command = [root.helper, "status"]
+    if (statusProc.running) { root.statusQueued = true; return }
+    statusProc.command = root.preferredType !== ""
+      ? [root.helper, "status", root.preferredType]
+      : [root.helper, "status"]
     statusProc.running = true
+  }
+
+  // Подключены и iPhone, и Android: показываем выбранный, остальной в переключателе.
+  function selectDevice(type) {
+    if (type === root.deviceType) return
+    root.preferredType = type
+    root.refreshStatus()
   }
 
   function applyStatus(raw) {
@@ -110,18 +134,31 @@ Panel {
     try { d = JSON.parse(String(raw || "")) } catch (e) { d = null }
     if (!d || typeof d.state !== "string") return
     var prev = root.deviceState
+    var prevKey = root.deviceKeyNow
+    var key = Model.deviceKey(d)
     root.device = d
     root.deviceState = d.state
     root.deviceMessage = String(d.message || "")
+    root.deviceType = String(d.type || "none")
+    root.deviceName = String(d.name || "")
+    root.devices = d.devices || []
     if (d.state === "ready") {
-      if (d.dcim !== root.currentDcim || prev !== "ready") {
-        root.currentDcim = String(d.dcim || "")
+      var roots = d.roots || []
+      var rootsKey = roots.join("\n")
+      var switched = prev === "ready" && key !== prevKey
+      if (switched) root.resetMedia()
+      root.deviceKeyNow = key
+      if (switched || prev !== "ready" || rootsKey !== root.currentRootsKey) {
+        root.currentRoots = roots
+        root.currentRootsKey = rootsKey
         root.loadList()
       }
-      if (prev !== "ready") indexKick.restart()
+      if ((switched || prev !== "ready") && root.isIphone) indexKick.restart()
     } else {
       if (prev === "ready") root.resetMedia()
-      root.currentDcim = ""
+      root.deviceKeyNow = key
+      root.currentRoots = []
+      root.currentRootsKey = ""
     }
   }
 
@@ -139,6 +176,7 @@ Panel {
     root.searchRows = []
     root.rowsQuery = ""
     root.searchQueued = false
+    root.listFresh = false
   }
 
   Process {
@@ -148,22 +186,56 @@ Panel {
       onStreamFinished: root.applyStatus(String(text || ""))
     }
     stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      if (root.statusQueued) { root.statusQueued = false; root.refreshStatus() }
+    }
   }
 
-  // ---------- листинг DCIM ----------
+  // ---------- листинг DCIM / Pictures ----------
+  // Android по MTP (gvfs) обходится медленно, поэтому последний полный листинг
+  // лежит в кэше хелпера: сетка появляется сразу, свежий обход идёт следом.
   function loadList() {
-    if (listProc.running || root.currentDcim === "") return
+    if (root.currentRoots.length === 0) return
+    if (listProc.running) { root.listQueued = true; return }
+    var key = root.deviceKeyNow
     root.scanning = true
-    listProc.command = [root.helper, "list", root.currentDcim]
+    root.listFresh = false
+    root.listDeviceKey = key
+    listProc.command = [root.helper, "list", "--cache", key].concat(root.currentRoots)
     listProc.running = true
+    if (root.isAndroid && root.items.length === 0 && !listCacheProc.running) {
+      listCacheProc.command = [root.helper, "list-cached", key]
+      listCacheProc.running = true
+    }
+  }
+
+  // В ключ превью идёт идентификатор устройства только у Android (хост MTP может
+  // повторяться у разных телефонов); ключи iPhone остались прежними, чтобы не
+  // перегенерировать уже накопленный кэш (путь AFC и так содержит UDID).
+  readonly property string thumbDeviceKey: root.isAndroid ? root.deviceKeyNow : ""
+
+  function sortList(items) {
+    return Model.sortItems(items, root.sortOrder, root.isAndroid)
   }
 
   function applyList(raw) {
-    root.items = Model.sortItems(Model.parseListing(String(raw || "")), root.sortOrder)
+    if (root.deviceState !== "ready" || root.listDeviceKey !== root.deviceKeyNow) return
+    root.listFresh = true
+    root.items = root.sortList(Model.parseListing(String(raw || ""), root.thumbDeviceKey))
     root.thumbState = ({})
     root.thumbRequested = ({})
     root.thumbQueue = []
     root.selection = ({})
+    root.recompute()
+  }
+
+  // Кэшированный листинг показываем, только пока свежий не пришёл.
+  function applyCachedList(raw) {
+    if (root.listFresh || root.items.length > 0) return
+    if (root.listDeviceKey !== root.deviceKeyNow) return
+    var parsed = Model.parseListing(String(raw || ""), root.thumbDeviceKey)
+    if (parsed.length === 0) return
+    root.items = root.sortList(parsed)
     root.recompute()
   }
 
@@ -174,14 +246,26 @@ Panel {
       onStreamFinished: root.applyList(String(text || ""))
     }
     stderr: StdioCollector { waitForEnd: true }
-    onExited: root.scanning = false
+    onExited: {
+      root.scanning = false
+      if (root.listQueued) { root.listQueued = false; root.loadList() }
+    }
+  }
+
+  Process {
+    id: listCacheProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyCachedList(String(text || ""))
+    }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   function recompute() {
-    var useIndex = root.indexReady && root.rowsQuery === root.query && Model.parseQuery(root.query).valid
+    var useIndex = root.isIphone && root.indexReady && root.rowsQuery === root.query && Model.parseQuery(root.query).valid
     root.shown = useIndex
       ? Model.mergeSearch(root.items, root.searchRows, root.query)
-      : Model.filterItems(root.items, root.query)
+      : Model.filterItems(root.items, root.query, root.isAndroid)
     if (root.cursor >= root.shown.length) root.cursor = Math.max(0, root.shown.length - 1)
     if (root.viewerIndex >= root.shown.length) root.viewerIndex = root.shown.length - 1
   }
@@ -196,7 +280,7 @@ Panel {
   // подключении телефона (инкрементально) или по кнопке. Пока он не готов,
   // фильтр ищет только по имени и папке и не ждёт индексацию.
   function runSearch() {
-    if (root.deviceState !== "ready") return
+    if (root.deviceState !== "ready" || !root.isIphone) return
     var q = Model.parseQuery(root.query)
     if (!root.indexReady || !q.valid) {
       root.searchRows = []
@@ -220,7 +304,7 @@ Panel {
   }
 
   function startIndex() {
-    if (root.indexRunning || root.deviceState !== "ready") return
+    if (root.indexRunning || root.deviceState !== "ready" || !root.isIphone) return
     root.indexRunning = true
     root.indexStatus = "Проверяю индекс…"
     root.indexError = ""
@@ -292,7 +376,7 @@ Panel {
 
   function setSort(order) {
     root.sortOrder = order
-    root.items = Model.sortItems(root.items, order)
+    root.items = root.sortList(root.items)
     root.recompute()
   }
   function toggleSort() { root.setSort(root.sortOrder === "new" ? "old" : "new") }
@@ -600,7 +684,7 @@ Panel {
     if (askDir) {
       root.enqueueJob("pick-dir", [root.home + "/Pictures"], { items: items })
     } else {
-      var dir = Model.defaultExportDir(root.home)
+      var dir = Model.defaultExportDir(root.home, root.deviceType)
       root.enqueueJob("names", [dir], { items: items, dir: dir })
     }
   }
@@ -642,20 +726,26 @@ Panel {
 
   // ---------- подписи состояний ----------
   function stateTitle(s) {
+    var android = root.isAndroid
     if (s === "no-tools") return "Нет libimobiledevice"
-    if (s === "no-device") return "iPhone не подключён"
+    if (s === "no-device") return "Телефон не подключён"
     if (s === "unpaired") return "Нужно доверие"
+    if (s === "locked") return "Телефон заблокирован"
+    if (s === "charge-only") return "Только зарядка"
     if (s === "no-backend") return "Нужен доступ к файлам"
     if (s === "mounting") return "Подключение…"
-    if (s === "no-dcim") return "Нет доступа к DCIM"
+    if (s === "no-dcim") return android ? "Нет папок DCIM и Pictures" : "Нет доступа к DCIM"
     if (s === "error") return "Ошибка"
     if (s === "ready") return "Готово"
-    return "iPhone"
+    return root.deviceLabel
   }
 
   function stateHint(s) {
+    var android = root.isAndroid
     if (s === "no-tools") return "sudo pacman -S libimobiledevice usbmuxd"
-    if (s === "no-backend") return "sudo pacman -S gvfs-afc\nзатем переподключите кабель"
+    if (s === "no-backend") return android
+      ? "sudo pacman -S gvfs-mtp\nзатем переподключите кабель"
+      : "sudo pacman -S gvfs-afc\nзатем переподключите кабель"
     if (s === "unpaired") return "Если окно доверия не появилось: idevicepair -u <UDID> pair"
     return ""
   }
@@ -701,7 +791,7 @@ Panel {
   onOpenedChanged: {
     if (root.opened) {
       root.refreshStatus()
-      if (root.deviceState === "ready" && root.items.length === 0) root.loadList()
+      if (root.deviceState === "ready" && root.items.length === 0 && !root.scanning) root.loadList()
     }
   }
 
@@ -758,7 +848,7 @@ Panel {
       }
       Text {
         textFormat: Text.PlainText
-        text: "iPhone"
+        text: root.deviceLabel
         color: Color.background
         font.family: root.fam
         font.pixelSize: Style.font.bodySmall
@@ -860,12 +950,14 @@ Panel {
 
           PanelHero {
             Layout.fillWidth: true
-            title: "Медиатека iPhone"
+            title: "Медиатека " + root.deviceLabel
             meta: {
               if (root.deviceState !== "ready") return "USB"
               var p = Model.countKind(root.items, "photo")
               var v = Model.countKind(root.items, "video")
               var base = p + " фото · " + v + " видео"
+              if (root.deviceName !== "" && root.deviceName !== root.deviceLabel)
+                base = root.deviceName + " · " + base
               if (root.scanning) base += " · обновление…"
               return base
             }
@@ -880,6 +972,31 @@ Panel {
                 font.pixelSize: Style.font.display
               }
             }
+          }
+
+          // --- переключатель устройств (когда подключены и iPhone, и Android) ---
+          RowLayout {
+            Layout.fillWidth: true
+            visible: root.devices.length > 1
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.devices
+              Button {
+                text: Model.deviceTypeLabel(modelData.type)
+                  + (modelData.name && modelData.name !== Model.deviceTypeLabel(modelData.type)
+                    ? " · " + modelData.name : "")
+                selected: modelData.type === root.deviceType
+                foreground: root.fg
+                fontFamily: root.fam
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(5)
+                focusable: false
+                onClicked: root.selectDevice(modelData.type)
+              }
+            }
+            Item { Layout.fillWidth: true }
           }
 
           // --- состояние «не готово» ---
@@ -953,9 +1070,11 @@ Panel {
             TextField {
               id: filterField
               Layout.fillWidth: true
-              placeholderText: root.indexReady
-                ? "имя файла, папка, содержимое…"
-                : "имя файла, папка…"
+              placeholderText: root.isAndroid
+                ? "имя файла, папка, дата…"
+                : (root.indexReady
+                  ? "имя файла, папка, содержимое…"
+                  : "имя файла, папка…")
               foreground: root.fg
               font.family: root.fam
               horizontalPadding: Style.space(10)
@@ -983,6 +1102,7 @@ Panel {
               onClicked: root.toggleSort()
             }
             Button {
+              visible: root.isIphone
               text: root.indexRunning ? "Индексация…" : "Обновить поиск"
               enabled: !root.indexRunning
               foreground: root.fg
@@ -995,11 +1115,23 @@ Panel {
             }
           }
 
+          // --- у Android нет индекса содержимого: честно говорим, что ищем ---
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            visible: root.deviceState === "ready" && root.isAndroid
+            elide: Text.ElideRight
+            text: "Android: поиск по содержимому недоступен — фильтр по имени файла и дате (2026-10-13, «13 октября»)"
+            color: root.dim
+            font.family: root.fam
+            font.pixelSize: Style.font.caption
+          }
+
           // --- состояние индекса поиска по содержимому ---
           Text {
             textFormat: Text.PlainText
             Layout.fillWidth: true
-            visible: root.indexRunning || root.indexError !== ""
+            visible: root.isIphone && (root.indexRunning || root.indexError !== "")
             elide: Text.ElideRight
             text: root.indexRunning
               ? (root.indexStatus !== "" ? root.indexStatus : "Индексирую…")
@@ -1034,8 +1166,11 @@ Panel {
             textFormat: Text.PlainText
             Layout.fillWidth: true
             visible: root.deviceState === "ready" && root.shown.length === 0
-            text: root.query !== "" ? "Ничего не найдено"
-              : (root.scanning ? "Читаю DCIM…" : "В DCIM нет фото и видео")
+            text: root.query !== ""
+              ? (root.isAndroid ? "Ничего не найдено по имени и дате" : "Ничего не найдено")
+              : (root.scanning
+                ? (root.isAndroid ? "Читаю DCIM и Pictures… по USB (MTP) это может занять время" : "Читаю DCIM…")
+                : (root.isAndroid ? "В DCIM и Pictures нет фото и видео" : "В DCIM нет фото и видео"))
             color: root.dim
             font.family: root.fam
             font.pixelSize: Style.font.caption
@@ -1059,8 +1194,8 @@ Panel {
                   : (root.deviceState === "ready"
                     ? (root.cursor >= 0 && root.cursor < root.shown.length && root.shown[root.cursor]
                       ? root.shown[root.cursor].name
-                      : "iPhone")
-                    : root.device.udid !== "" ? root.device.udid : "USB")
+                      : root.deviceLabel)
+                    : root.device.id !== "" ? root.device.id : "USB")
                 color: root.notice !== "" ? root.accentC : root.dim
                 font.family: root.fam
                 font.pixelSize: Style.font.caption
