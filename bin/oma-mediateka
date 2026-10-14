@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # oma-mediateka — системный хелпер плагина Omaimediateka.
 #
-# Доступ к DCIM iPhone через gvfs-afc (см. docs/superpowers/specs). Скрипт
-# ничего не монтирует от root: gvfs монтирует пользовательская сессия, а
-# usbmuxd поднимает udev при подключении кабеля.
+# Доступ к DCIM iPhone через gvfs-afc (см. docs/superpowers/specs) и к
+# DCIM/Pictures Android через gvfs-mtp. Скрипт ничего не монтирует от root:
+# gvfs монтирует пользовательская сессия, а usbmuxd поднимает udev при
+# подключении кабеля. На телефонах только читаем: ни записи, ни удаления.
 #
 # Подкоманды:
-#   status                      — состояние устройства одной JSON-строкой
-#   list <dcim>                 — TSV листинг медиафайлов (mtime, size, path)
+#   status [iphone|android] [--force]
+#                               — состояние устройства одной JSON-строкой (--force:
+#                                 явная повторная попытка к Android, мимо бэкоффа)
+#   list [--cache KEY] <dir>... — TSV листинг медиафайлов (mtime, size, path)
+#   list-cached <KEY>           — последний сохранённый листинг (код 1, если нет)
 #   thumb <src> <dst> <kind> [variant]
 #                               — превью JPEG в кэш (variant: thumb|preview)
 #   meta <src>                  — длительность/размеры (video), TSV
@@ -15,7 +19,8 @@
 #                                 для поиска по смыслу
 #   search <query>              — TSV path<TAB>source<TAB>matched
 #
-# Коды выхода: 0 — успех, 1 — нет данных/ошибка.
+# Коды выхода: 0 — успех, 1 — нет данных/ошибка, 5 — поиск по содержимому
+# недоступен для этого устройства (не iPhone).
 set -u
 
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -32,11 +37,57 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g'
 }
 
+# --- устройства: iPhone (AFC) и Android (MTP) ---------------------------------
+#
+# Каждый detect_* заполняет глобальные D_* (состояние одного устройства), затем
+# save_dev копирует их в префиксные переменные (IPH_*, AND_*). cmd_status
+# выбирает одно устройство для показа и перечисляет все найденные в `devices`.
+
+MTP_LIBDIRS="${OMA_GVFS_LIBDIRS:-/usr/lib /usr/lib/gvfs /usr/libexec}"
+USB_SYSFS="${OMA_USB_SYSFS:-/sys/bus/usb/devices}"
+# Производители телефонов на Android (USB vendor id). Нужны только чтобы отличить
+# «Android подключён в режиме зарядки» от «ничего не подключено»: в режиме
+# зарядки телефон не открывает MTP и gvfs его не видит.
+ANDROID_VENDORS="${OMA_ANDROID_VENDORS:-18d1 04e8 2717 12d1 2a70 22b8 0fce 1004 0bb4 22d9 0b05 2e04 2d95 1bbb 0e8d 19d2 2a45 05c6}"
+
+reset_dev() {
+  D_STATE="none"; D_BACKEND="none"; D_NAME=""; D_MODEL=""; D_ID=""; D_MOUNT=""; D_ROOTS=""; D_MSG=""
+}
+
+save_dev() {
+  declare -g "${1}_STATE=$D_STATE" "${1}_BACKEND=$D_BACKEND" "${1}_NAME=$D_NAME" \
+    "${1}_MODEL=$D_MODEL" "${1}_ID=$D_ID" "${1}_MOUNT=$D_MOUNT" "${1}_ROOTS=$D_ROOTS" "${1}_MSG=$D_MSG"
+}
+
+load_dev() {
+  local v
+  for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
+    local ref="${1}_$v"
+    declare -g "D_$v=${!ref}"
+  done
+}
+
+# JSON-массив строк из списка, разделённого переводами строк.
+json_array() {
+  local out="" line first=1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$first" = 1 ] || out="$out,"
+    out="$out\"$(json_escape "$line")\""
+    first=0
+  done <<< "$1"
+  printf '[%s]' "$out"
+}
+
+# Один JSON-объект на строку состояния: state type name id mount roots msg.
 emit() {
-  # state backend udid mount dcim message
-  printf '{"state":"%s","backend":"%s","udid":"%s","mount":"%s","dcim":"%s","message":"%s"}\n' \
-    "$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "$3")" \
-    "$(json_escape "$4")" "$(json_escape "$5")" "$(json_escape "$6")"
+  local type="$1" devices="$2"
+  printf '{"state":"%s","backend":"%s","type":"%s","name":"%s","model":"%s","id":"%s","udid":"%s","mount":"%s","dcim":"%s","roots":%s,"devices":%s,"message":"%s"}\n' \
+    "$(json_escape "$D_STATE")" "$(json_escape "$D_BACKEND")" "$type" \
+    "$(json_escape "$D_NAME")" "$(json_escape "$D_MODEL")" "$(json_escape "$D_ID")" \
+    "$([ "$type" = iphone ] && json_escape "$D_ID")" \
+    "$(json_escape "$D_MOUNT")" "$(json_escape "$(printf '%s' "$D_ROOTS" | head -n1)")" \
+    "$(json_array "$D_ROOTS")" "$devices" "$(json_escape "$D_MSG")"
 }
 
 # Находит каталог монтирования afc для UDID (или любой, если UDID пуст).
@@ -53,36 +104,108 @@ find_afc_mount() {
   return 1
 }
 
-# --- status ----------------------------------------------------------------
+# Каталог монтирования MTP (любой первый).
+# Только имена из каталога gvfs (readdir), без обращения к самому телефону.
+find_mtp_mount() {
+  local d
+  for d in "$GVFS_DIR"/mtp:host=*; do
+    [ "${d##*=}" = "*" ] && continue
+    printf '%s' "$d"
+    return 0
+  done
+  return 1
+}
 
-cmd_status() {
+have_gvfs_backend() {
+  # $1 — имя демона (gvfsd-afc, gvfsd-mtp), $2 — пакет pacman.
+  local d
+  for d in $MTP_LIBDIRS; do
+    [ -x "$d/$1" ] && return 0
+  done
+  pacman -Qq "$2" >/dev/null 2>&1
+}
+
+# ProductType (iPhone16,1) -> «iPhone 15 Pro». Неизвестный тип остаётся как есть.
+iphone_marketing_name() {
+  case "$1" in
+    iPhone10,1|iPhone10,4) echo "iPhone 8" ;;
+    iPhone10,2|iPhone10,5) echo "iPhone 8 Plus" ;;
+    iPhone10,3|iPhone10,6) echo "iPhone X" ;;
+    iPhone11,2) echo "iPhone XS" ;;
+    iPhone11,4|iPhone11,6) echo "iPhone XS Max" ;;
+    iPhone11,8) echo "iPhone XR" ;;
+    iPhone12,1) echo "iPhone 11" ;;
+    iPhone12,3) echo "iPhone 11 Pro" ;;
+    iPhone12,5) echo "iPhone 11 Pro Max" ;;
+    iPhone12,8) echo "iPhone SE (2nd gen)" ;;
+    iPhone13,1) echo "iPhone 12 mini" ;;
+    iPhone13,2) echo "iPhone 12" ;;
+    iPhone13,3) echo "iPhone 12 Pro" ;;
+    iPhone13,4) echo "iPhone 12 Pro Max" ;;
+    iPhone14,2) echo "iPhone 13 Pro" ;;
+    iPhone14,3) echo "iPhone 13 Pro Max" ;;
+    iPhone14,4) echo "iPhone 13 mini" ;;
+    iPhone14,5) echo "iPhone 13" ;;
+    iPhone14,6) echo "iPhone SE (3rd gen)" ;;
+    iPhone14,7) echo "iPhone 14" ;;
+    iPhone14,8) echo "iPhone 14 Plus" ;;
+    iPhone15,2) echo "iPhone 14 Pro" ;;
+    iPhone15,3) echo "iPhone 14 Pro Max" ;;
+    iPhone15,4) echo "iPhone 15" ;;
+    iPhone15,5) echo "iPhone 15 Plus" ;;
+    iPhone16,1) echo "iPhone 15 Pro" ;;
+    iPhone16,2) echo "iPhone 15 Pro Max" ;;
+    iPhone17,1) echo "iPhone 16 Pro" ;;
+    iPhone17,2) echo "iPhone 16 Pro Max" ;;
+    iPhone17,3) echo "iPhone 16" ;;
+    iPhone17,4) echo "iPhone 16 Plus" ;;
+    iPhone17,5) echo "iPhone 16e" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+detect_iphone() {
+  reset_dev
+  D_NAME="iPhone"
   if ! command -v idevice_id >/dev/null 2>&1; then
-    emit "no-tools" "none" "" "" "" \
-      "Не установлен libimobiledevice. Установите: sudo pacman -S libimobiledevice usbmuxd"
+    D_STATE="no-tools"
+    D_MSG="Не установлен libimobiledevice. Установите: sudo pacman -S libimobiledevice usbmuxd"
     return 0
   fi
 
   local udids udid
   udids="$(idevice_id -l 2>/dev/null)"
   if [ -z "$udids" ]; then
-    emit "no-device" "none" "" "" "" \
-      "iPhone не подключён. Подключите кабелем, разблокируйте и нажмите «Доверять»."
+    D_STATE="absent"
     return 0
   fi
   udid="$(printf '%s\n' "$udids" | head -n1)"
+  D_ID="$udid"
 
   local paired=1
   if command -v idevicepair >/dev/null 2>&1; then
     idevicepair -u "$udid" validate >/dev/null 2>&1 || paired=0
   fi
+  if command -v ideviceinfo >/dev/null 2>&1; then
+    local pt
+    pt="$(timeout 3 ideviceinfo -u "$udid" -k ProductType 2>/dev/null | head -n1)"
+    case "$pt" in
+      iPhone*|iPad*|iPod*) D_MODEL="$(iphone_marketing_name "$pt")" ;;
+    esac
+  fi
+  if [ "$paired" = 1 ] && command -v idevicename >/dev/null 2>&1; then
+    local nm
+    nm="$(timeout 3 idevicename -u "$udid" 2>/dev/null | head -n1)"
+    [ -n "$nm" ] && D_NAME="$nm"
+  fi
 
   local backend="none"
-  if [ -x /usr/lib/gvfsd-afc ] || [ -x /usr/lib/gvfs/gvfsd-afc ] \
-     || pacman -Qq gvfs-afc >/dev/null 2>&1; then
+  if have_gvfs_backend gvfsd-afc gvfs-afc; then
     backend="gvfs"
   elif command -v ifuse >/dev/null 2>&1; then
     backend="ifuse"
   fi
+  D_BACKEND="$backend"
 
   local mount=""
   mount="$(find_afc_mount "$udid" || true)"
@@ -91,41 +214,437 @@ cmd_status() {
     timeout 15 gio mount "afc://$udid/" >/dev/null 2>&1 || true
     mount="$(find_afc_mount "$udid" || true)"
   fi
+  D_MOUNT="$mount"
 
-  local dcim=""
-  [ -n "$mount" ] && dcim="$mount/DCIM"
-
-  if [ -n "$mount" ] && [ -d "$dcim" ]; then
-    emit "ready" "$backend" "$udid" "$mount" "$dcim" ""
+  if [ -n "$mount" ] && [ -d "$mount/DCIM" ]; then
+    D_STATE="ready"
+    D_ROOTS="$mount/DCIM"
   elif [ -n "$mount" ]; then
-    emit "no-dcim" "$backend" "$udid" "$mount" "" \
-      "Разблокируйте iPhone и подтвердите доступ к фото."
+    D_STATE="no-dcim"
+    D_MSG="Разблокируйте iPhone и подтвердите доступ к фото."
   elif [ "$paired" != 1 ]; then
-    emit "unpaired" "$backend" "$udid" "" "" \
-      "iPhone не доверяет компьютеру. Нажмите «Доверять» на телефоне; при необходимости: idevicepair -u $udid pair"
+    D_STATE="unpaired"
+    D_MSG="iPhone не доверяет компьютеру. Нажмите «Доверять» на телефоне; при необходимости: idevicepair -u $udid pair"
   elif [ "$backend" = "none" ]; then
-    emit "no-backend" "none" "$udid" "" "" \
-      "Нет доступа к файлам iPhone. Установите: sudo pacman -S gvfs-afc"
+    D_STATE="no-backend"
+    D_MSG="Нет доступа к файлам iPhone. Установите: sudo pacman -S gvfs-afc"
   else
-    emit "mounting" "$backend" "$udid" "" "" \
-      "Монтирование iPhone… Если не помогает, переподключите кабель."
+    D_STATE="mounting"
+    D_MSG="Монтирование iPhone… Если не помогает, переподключите кабель."
   fi
+}
+
+# Есть ли на USB устройство производителя телефонов (без mass-storage и хабов).
+android_usb_present() {
+  local dev vid ifc cls bad
+  [ -d "$USB_SYSFS" ] || return 1
+  for dev in "$USB_SYSFS"/*; do
+    [ -r "$dev/idVendor" ] || continue
+    vid="$(tr 'A-Z' 'a-z' < "$dev/idVendor" 2>/dev/null)"
+    case " $ANDROID_VENDORS " in *" $vid "*) ;; *) continue ;; esac
+    bad=0
+    for ifc in "$dev"/*:*/bInterfaceClass; do
+      [ -r "$ifc" ] || continue
+      cls="$(cat "$ifc" 2>/dev/null)"
+      case "$cls" in 08|09) bad=1 ;; esac
+    done
+    [ "$bad" = 1 ] && continue
+    return 0
+  done
+  return 1
+}
+
+# Вывод `gio mount -li` (один вызов на status; activation_root есть только с -i).
+GIO_LIST=""
+gio_list() {
+  [ -n "$GIO_LIST" ] || GIO_LIST="$(timeout 5 gio mount -li 2>/dev/null || true)"
+  printf '%s\n' "$GIO_LIST"
+}
+
+# URI MTP-томов, которые gvfs видит (activation_root=mtp://…).
+mtp_volume_uris() {
+  gio_list | sed -n 's/^[[:space:]]*activation_root=\(mtp:\/\/.*\)$/\1/p'
+}
+
+# Человеческое имя телефона по хосту: «Mount(0): Pixel 7 -> mtp://host/».
+mtp_display_name() {
+  local host="$1" name re
+  re="$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')"
+  # Под одним host gvfs показывает два Mount (теневой с именем телефона и «mtp»).
+  name="$(gio_list | sed -n "s/^[[:space:]]*Mount([0-9]*): \(.*\) -> mtp:\/\/$re\/\$/\1/p" | grep -vix mtp | head -n1)"
+  if [ -z "$name" ]; then
+    name="$(gio_list | sed -n "s/^Volume([0-9]*): \(.*\)\$/\1/p" | head -n1)"
+  fi
+  printf '%s' "$name"
+}
+
+# Имя, которое телефон сообщает по MTP (`gio info`): «Pixel 8», «Galaxy S9+ пользователя
+# Имя». Работает только для смонтированного тома. Хвост с именем владельца отсекается.
+mtp_info_name() {
+  local n
+  n="$(timeout 5 gio info -a standard::display-name "mtp://$1/" 2>/dev/null | sed -n 's/^display name: //p' | head -n1)"
+  printf '%s' "$n" | sed -E 's/ пользователя .*$//; s/ of .*$//'
+}
+
+# Модель телефона: имя из `gio info`, иначе из списка gvfs. Общие слова
+# («SAMSUNG Android», «mtp») модели не считаются.
+android_model() {
+  local m
+  m="$(clean_model "$(mtp_info_name "$1")")"
+  [ -n "$m" ] || m="$(clean_model "$(mtp_display_name "$1")")"
+  printf '%s' "$m"
+}
+
+# Модель из MTP-имени gvfs («Pixel 8»); пусто, если там только общее слово.
+clean_model() {
+  local m="${1//_/ }"
+  m="$(printf '%s' "$m" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  case "$(printf '%s' "$m" | tr 'A-Z' 'a-z')" in
+    ""|*android|*"android device"|*"mtp device"|mtp|"usb device") m="" ;;
+  esac
+  printf '%s' "$m"
+}
+
+# Строка product из sysfs первого USB-устройства известного производителя Android.
+android_usb_product() {
+  local dev vid
+  [ -d "$USB_SYSFS" ] || return 1
+  for dev in "$USB_SYSFS"/*; do
+    [ -r "$dev/idVendor" ] && [ -r "$dev/product" ] || continue
+    vid="$(tr 'A-Z' 'a-z' < "$dev/idVendor" 2>/dev/null)"
+    case " $ANDROID_VENDORS " in *" $vid "*) ;; *) continue ;; esac
+    head -n1 "$dev/product"
+    return 0
+  done
+  return 1
+}
+
+# --- Android: бережное обращение с MTP -------------------------------------
+#
+# MTP-сессия телефона хрупкая: частые повторные открытия/монтирования при
+# заблокированном экране («Get Storage information failed») могут повесить
+# телефон. Поэтому:
+#   * status НЕ монтирует том при каждом опросе: одна попытка на подключение
+#     (ключ — USB-устройство тома), дальше только проверка уже смонтированного
+#     пути; повтор — явным `status --force` (кнопка «Проверить снова»);
+#   * после неудачи/пустого тома — бэкофф MTP_BACKOFF с (по умолчанию 30) без
+#     единого обращения к устройству, ответ берётся из кэша состояния;
+#   * готовое состояние переиспользуется MTP_READY_TTL с;
+#   * один процесс на устройство: flock; status не ждёт (занято — отдаёт кэш),
+#     а list/thumb/meta/copy по MTP-пути ждут своей очереди.
+
+MTP_LOCK="${OMA_MTP_LOCK:-$RUNTIME/omaimediateka-mtp.lock}"
+MTP_STATE="$CACHE_DIR/android-state/android.state"
+MTP_BACKOFF="${OMA_MTP_BACKOFF:-30}"
+MTP_READY_TTL="${OMA_MTP_READY_TTL:-60}"
+MTP_FORCE_MIN="${OMA_MTP_FORCE_MIN:-10}"
+FORCE=0
+
+now() { printf '%s' "${OMA_NOW:-$(date +%s)}"; }
+
+android_state_load() {
+  S_TS=0; S_UNTIL=0; S_KEY=""; S_ATTEMPT=""; S_FAILS=0
+  S_STATE=""; S_BACKEND=""; S_NAME=""; S_MODEL=""; S_ID=""; S_MOUNT=""; S_ROOTS=""; S_MSG=""
+  # shellcheck disable=SC1090
+  [ -f "$MTP_STATE" ] && . "$MTP_STATE" 2>/dev/null
+  return 0
+}
+
+android_state_save() {
+  mkdir -p "$(dirname "$MTP_STATE")" 2>/dev/null || return 0
+  local tmp v ref
+  tmp="$(mktemp "$MTP_STATE.XXXXXX")" || return 0
+  {
+    printf 'S_TS=%q\nS_UNTIL=%q\nS_KEY=%q\nS_ATTEMPT=%q\nS_FAILS=%q\n' "$(now)" "$NEW_UNTIL" "$NEW_KEY" "$NEW_ATTEMPT" "$NEW_FAILS"
+    for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
+      ref="D_$v"
+      printf 'S_%s=%q\n' "$v" "${!ref}"
+    done
+  } > "$tmp"
+  mv -f "$tmp" "$MTP_STATE"
+}
+
+android_state_apply() {
+  local v ref
+  for v in STATE BACKEND NAME MODEL ID MOUNT ROOTS MSG; do
+    ref="S_$v"
+    declare -g "D_$v=${!ref}"
+  done
+}
+
+# Бэкофф растёт при повторных неудачах на том же подключении: 30, 60, 120, 240, 300 с.
+backoff_secs() {
+  local n="$1" b="$MTP_BACKOFF"
+  while [ "$n" -gt 0 ] && [ "$b" -lt 300 ]; do b=$((b * 2)); n=$((n - 1)); done
+  [ "$b" -gt 300 ] && [ "$MTP_BACKOFF" -le 300 ] && b=300
+  printf '%s' "$b"
+}
+
+# Ключ подключения: USB-устройство тома (меняется при переподключении).
+mtp_volume_key() {
+  local uri dev
+  uri="$(mtp_volume_uris | head -n1)"
+  # unix-device именно того Volume, у которого activation_root=mtp:// (в выводе
+  # есть и диски со своими unix-device).
+  dev="$(gio_list | awk '/^[[:space:]]*Volume\(/ {d=""} /unix-device:/ {d=$0; sub(/^[^\x27]*\x27/, "", d); sub(/\x27.*$/, "", d)} /activation_root=mtp:\/\// {print d; exit}')"
+  printf '%s|%s' "$uri" "$dev"
+}
+
+# Зондирование под локом. Выставляет D_*, NEW_UNTIL/NEW_KEY/NEW_ATTEMPT и
+# REUSED=1, если ответ целиком взят из кэша (тогда файл состояния не трогаем).
+probe_android() {
+  reset_dev
+  D_NAME="Android"
+  local t usb=0 backend=0 mount force_ok=0
+  t="$(now)"
+  android_state_load
+  NEW_UNTIL=0; NEW_KEY=""; NEW_ATTEMPT="$S_ATTEMPT"; NEW_FAILS=0; REUSED=0
+
+  android_usb_present && usb=1
+  have_gvfs_backend gvfsd-mtp gvfs-mtp && backend=1
+  mount="$(find_mtp_mount || true)"
+  [ -n "$mount" ] && backend=1
+  [ "$backend" = 1 ] && D_BACKEND="gvfs"
+  if [ "$FORCE" = 1 ] && [ $((t - S_TS)) -ge "$MTP_FORCE_MIN" ]; then force_ok=1; fi
+
+  local uris="" key=""
+  if [ -n "$mount" ]; then
+    key="$mount"
+  elif [ "$backend" = 1 ]; then
+    uris="$(mtp_volume_uris)"
+    [ -n "$uris" ] && key="$(mtp_volume_key)"
+  fi
+
+  # Кэш: готовое — на TTL, неудача/пустой том — на время бэкоффа. К устройству
+  # не обращаемся вовсе.
+  if [ -n "$key" ] && [ "$S_KEY" = "$key" ] && [ -n "$S_STATE" ] && [ "$force_ok" = 0 ] \
+     && [ "$t" -lt "$S_UNTIL" ]; then
+    android_state_apply
+    NEW_UNTIL="$S_UNTIL"; NEW_KEY="$S_KEY"; NEW_FAILS="$S_FAILS"; REUSED=1
+    return 0
+  fi
+
+  if [ -z "$mount" ] && [ -n "$uris" ]; then
+    # Том виден, но не смонтирован: одна попытка на подключение (или явная).
+    if [ "$key" != "$S_ATTEMPT" ] || [ "$force_ok" = 1 ]; then
+      NEW_ATTEMPT="$key"
+      timeout 15 gio mount "$(printf '%s\n' "$uris" | head -n1)" >/dev/null 2>&1 || true
+      mount="$(find_mtp_mount || true)"
+    fi
+    if [ -z "$mount" ]; then
+      D_STATE="locked"
+      D_MODEL="$(clean_model "$(mtp_display_name "$(printf '%s\n' "$uris" | head -n1 | sed 's#^mtp://##; s#/$##')")")"
+      D_NAME="${D_MODEL:-Android}"
+      D_MSG="Разблокируйте телефон и выберите «Передача файлов», затем нажмите «Проверить снова»."
+      [ "$S_KEY" = "$key" ] && NEW_FAILS=$((S_FAILS + 1))
+      NEW_UNTIL=$((t + $(backoff_secs "$NEW_FAILS"))); NEW_KEY="$key"
+      [ -n "$D_MODEL" ] || D_MODEL="$(clean_model "$(android_usb_product || true)")"
+      return 0
+    fi
+    key="$mount"
+  fi
+
+  if [ -n "$mount" ]; then
+    local host
+    host="$(basename "$mount")"
+    host="${host#mtp:host=}"
+    D_ID="$host"
+    D_MOUNT="$mount"
+    if [ "$S_MOUNT" = "$mount" ] && [ -n "$S_MODEL" ]; then
+      D_MODEL="$S_MODEL"
+    else
+      D_MODEL="$(android_model "$host")"
+    fi
+    D_NAME="${D_MODEL:-Android}"
+    local roots="" nstorage=0 s sub
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      nstorage=$((nstorage + 1))
+      for sub in DCIM Pictures; do
+        [ -d "$s/$sub" ] && roots="${roots:+$roots
+}$s/$sub"
+      done
+    done < <(timeout 10 find "$mount" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    D_ROOTS="$roots"
+    NEW_KEY="$mount"
+    if [ -n "$roots" ]; then
+      D_STATE="ready"
+      NEW_UNTIL=$((t + MTP_READY_TTL))
+    elif [ "$nstorage" -gt 0 ]; then
+      D_STATE="no-dcim"
+      D_MSG="В памяти телефона нет папок DCIM и Pictures."
+      NEW_UNTIL=$((t + MTP_READY_TTL))
+    else
+      # Том пуст: телефон заблокирован или не отдаёт хранилище. Не дёргаем.
+      D_STATE="locked"
+      D_MSG="Разблокируйте телефон и в уведомлении USB выберите «Передача файлов», затем нажмите «Проверить снова»."
+      [ "$S_KEY" = "$mount" ] && NEW_FAILS=$((S_FAILS + 1))
+      NEW_UNTIL=$((t + $(backoff_secs "$NEW_FAILS")))
+    fi
+  elif [ "$usb" = 1 ] && [ "$backend" = 0 ]; then
+    D_STATE="no-backend"
+    D_MSG="Нет доступа к файлам Android. Установите: sudo pacman -S gvfs-mtp"
+    NEW_ATTEMPT=""
+  elif [ "$usb" = 1 ]; then
+    D_STATE="charge-only"
+    D_MSG="Телефон подключён только для зарядки. Откройте уведомление USB на телефоне и выберите «Передача файлов»."
+    NEW_ATTEMPT=""
+  else
+    D_STATE="absent"
+    NEW_ATTEMPT=""
+  fi
+  # MTP-имя не дало модель (или MTP ещё нет, режим зарядки): берём product из USB.
+  if [ "$D_STATE" != absent ] && [ -z "$D_MODEL" ]; then
+    D_MODEL="$(clean_model "$(android_usb_product || true)")"
+  fi
+}
+
+detect_android() {
+  reset_dev
+  D_NAME="Android"
+  mkdir -p "$(dirname "$MTP_LOCK")" 2>/dev/null
+  local rc
+  (
+    flock -n 9 || exit 99
+    probe_android
+    [ "$REUSED" = 1 ] || android_state_save
+  ) 9>"$MTP_LOCK"
+  rc=$?
+  android_state_load
+  if [ "$rc" = 99 ]; then
+    # Устройство занято другим процессом (листинг, превью, чужой status):
+    # к нему не лезем, отдаём последнее известное, если том тот же.
+    local cur
+    cur="$(find_mtp_mount || true)"
+    if [ -n "$S_STATE" ] && [ "$S_MOUNT" = "$cur" ]; then
+      android_state_apply
+    else
+      D_STATE="mounting"
+      D_BACKEND="gvfs"
+      D_MSG="Телефон занят другой операцией, проверяю…"
+    fi
+  else
+    android_state_apply
+  fi
+  [ -n "$D_NAME" ] || D_NAME="Android"
+}
+
+# Команды с данными телефона по MTP-пути идут по одной (общий лок с status).
+mtp_locked() {
+  local p="$1"; shift
+  case "$p" in */mtp:host=*) ;; *) "$@"; return $? ;; esac
+  mkdir -p "$(dirname "$MTP_LOCK")" 2>/dev/null
+  (
+    flock -w "${OMA_MTP_LOCK_WAIT:-300}" 9 || exit 98
+    "$@"
+  ) 9>"$MTP_LOCK"
+}
+
+# --- status ----------------------------------------------------------------
+
+# status [iphone|android] — состояние одного устройства JSON-строкой; поле
+# `devices` перечисляет все найденные телефоны. Если подключены оба, показывается
+# запрошенный тип, иначе первый готовый (iPhone раньше Android).
+cmd_status() {
+  local prefer="" a
+  for a in "$@"; do
+    case "$a" in
+      --force) FORCE=1 ;;
+      iphone|android) prefer="$a" ;;
+    esac
+  done
+  detect_iphone; save_dev IPH
+  detect_android; save_dev AND
+
+  local devices="" first=1 p type
+  for p in IPH AND; do
+    local st="${p}_STATE" nm="${p}_NAME" id="${p}_ID"
+    case "${!st}" in absent|no-tools|none) continue ;; esac
+    [ "$p" = IPH ] && type=iphone || type=android
+    [ "$first" = 1 ] || devices="$devices,"
+    devices="$devices{\"type\":\"$type\",\"name\":\"$(json_escape "${!nm}")\",\"id\":\"$(json_escape "${!id}")\",\"state\":\"$(json_escape "${!st}")\"}"
+    first=0
+  done
+  devices="[$devices]"
+
+  local pick=""
+  if [ "$prefer" = iphone ] && [ "$IPH_STATE" != absent ] && [ "$IPH_STATE" != no-tools ]; then
+    pick=IPH
+  elif [ "$prefer" = android ] && [ "$AND_STATE" != absent ]; then
+    pick=AND
+  elif [ "$IPH_STATE" = ready ]; then
+    pick=IPH
+  elif [ "$AND_STATE" = ready ]; then
+    pick=AND
+  elif [ "$IPH_STATE" != absent ] && [ "$IPH_STATE" != no-tools ]; then
+    pick=IPH
+  elif [ "$AND_STATE" != absent ]; then
+    pick=AND
+  fi
+
+  if [ -n "$pick" ]; then
+    load_dev "$pick"
+    [ "$pick" = IPH ] && type=iphone || type=android
+    emit "$type" "$devices"
+    return 0
+  fi
+
+  # Ничего не найдено. Без libimobiledevice iPhone не обнаружить вовсе — про это
+  # стоит сказать, пока нет другого признака телефона.
+  reset_dev
+  if [ "$IPH_STATE" = no-tools ] && ! have_gvfs_backend gvfsd-mtp gvfs-mtp; then
+    D_STATE="no-tools"
+    D_MSG="$IPH_MSG"
+    emit "iphone" "$devices"
+    return 0
+  fi
+  D_STATE="no-device"
+  D_MSG="Телефон не подключён. iPhone: подключите кабелем и нажмите «Доверять». Android: выберите режим «Передача файлов»."
+  emit "none" "$devices"
 }
 
 # --- list ------------------------------------------------------------------
 
 cmd_list() {
-  local dcim="${1:-}"
-  [ -n "$dcim" ] || { echo "usage: oma-mediateka list <dcim>" >&2; return 2; }
-  [ -d "$dcim" ] || return 0
+  local key=""
+  if [ "${1:-}" = "--cache" ]; then
+    key="$(printf '%s' "${2:-}" | tr -c 'A-Za-z0-9._-' '_')"
+    shift 2
+  fi
+  [ "$#" -gt 0 ] || { echo "usage: oma-mediateka list [--cache KEY] <dir>..." >&2; return 2; }
+  local dirs=() d
+  for d in "$@"; do
+    [ -d "$d" ] && dirs+=("$d")
+  done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
 
-  find -L "$dcim" -type f \
-    ! -name '.*' ! -path '*/__MACOSX/*' \
+  # Скрытые файлы и каталоги (.thumbnails, .trashed-*) отсекаются целиком.
+  local tmp rc
+  tmp="$(mktemp)" || return 1
+  find -L "${dirs[@]}" -mindepth 1 \( -name '.*' -o -name '__MACOSX' \) -prune -o \
+    -type f \
     ! -iname '*.aae' ! -iname '*.thm' ! -iname '*.xmp' \
     \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
        -o -iname '*.heif' -o -iname '*.webp' -o -iname '*.gif' \
-       -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' \) \
-    -printf '%T@\t%s\t%p\n' 2>/dev/null
+       -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' \
+       -o -iname '*.3gp' -o -iname '*.mkv' -o -iname '*.webm' \) \
+    -printf '%T@\t%s\t%p\n' >"$tmp" 2>/dev/null
+  rc=$?
+  cat "$tmp"
+  # MTP через gvfs медленный: полный листинг кладём в кэш, чтобы при следующем
+  # подключении показать сетку сразу, пока идёт свежий обход.
+  if [ -n "$key" ] && [ "$rc" = 0 ]; then
+    mkdir -p "$CACHE_DIR/lists" 2>/dev/null && mv -f "$tmp" "$CACHE_DIR/lists/$key.tsv" && return 0
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+cmd_list_cached() {
+  local key
+  key="$(printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -n "$key" ] && [ -s "$CACHE_DIR/lists/$key.tsv" ] || return 1
+  cat "$CACHE_DIR/lists/$key.tsv"
 }
 
 # --- thumb -----------------------------------------------------------------
@@ -151,23 +670,23 @@ cmd_thumb() {
       if [ "$ext" = "heic" ] || [ "$ext" = "heif" ]; then
         local td
         td="$(mktemp -d)"
-        if heif-convert -q 85 "$src" "$td/img.jpg" >/dev/null 2>&1; then
+        if timeout 120 heif-convert -q 85 "$src" "$td/img.jpg" >/dev/null 2>&1; then
           local first
           first="$(ls "$td"/*.jpg 2>/dev/null | head -n1)"
           if [ -n "$first" ] && \
-             ffmpeg -y -loglevel error -i "$first" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+             timeout 60 ffmpeg -y -loglevel error -i "$first" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
             ok=1
           fi
         fi
         rm -rf "$td"
       else
-        if ffmpeg -y -loglevel error -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+        if timeout 120 ffmpeg -y -loglevel error -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
           ok=1
         fi
       fi
       ;;
     video)
-      if ffmpeg -y -loglevel error -ss 0.5 -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
+      if timeout 120 ffmpeg -y -loglevel error -ss 0.5 -i "$src" -vf "$scale" -frames:v 1 "$tmp" >/dev/null 2>&1; then
         ok=1
       fi
       ;;
@@ -187,10 +706,16 @@ cmd_meta() {
   local src="${1:-}"
   [ -n "$src" ] || { echo "usage: oma-mediateka meta <src>" >&2; return 2; }
   command -v ffprobe >/dev/null 2>&1 || return 1
-  local dur w h
-  dur="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
-  w="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
-  h="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  # Один вызов ffprobe: gvfs-mtp при каждом открытии скачивает файл целиком.
+  local dur="" w="" h="" line
+  while IFS= read -r line; do
+    case "$line" in
+      duration=*) [ -n "$dur" ] || dur="${line#duration=}" ;;
+      width=*)    [ -n "$w" ] || w="${line#width=}" ;;
+      height=*)   [ -n "$h" ] || h="${line#height=}" ;;
+    esac
+  done < <(timeout 60 ffprobe -v error -select_streams v:0 \
+    -show_entries format=duration:stream=width,height -of default=nw=1 "$src" 2>/dev/null)
   printf '%s\t%s\t%s\n' "${dur:-0}" "${w:-0}" "${h:-0}"
 }
 
@@ -272,6 +797,9 @@ cmd_index() {
     return 4
   fi
   local mount="${1:-}"
+  case "$mount" in
+    *mtp:host=*) echo "Поиск по содержимому доступен только для iPhone" >&2; return 5 ;;
+  esac
   [ -n "$mount" ] || mount="$(find_afc_mount "" || true)"
   [ -n "$mount" ] || { echo "iPhone не смонтирован" >&2; return 1; }
   local udid
@@ -284,23 +812,33 @@ cmd_index() {
 cmd_search() {
   local query="${1:-}"
   [ -n "$query" ] || return 0
-  [ -f "$SEARCH_DB" ] || return 1
-  if ! command -v python3 >/dev/null 2>&1; then return 4; fi
   local mount
   mount="$(find_afc_mount "" || true)"
+  if [ -z "$mount" ] && find_mtp_mount >/dev/null; then
+    echo "Поиск по содержимому доступен только для iPhone" >&2
+    return 5
+  fi
+  [ -f "$SEARCH_DB" ] || return 1
+  if ! command -v python3 >/dev/null 2>&1; then return 4; fi
   python3 "$INDEX_PY" search "$mount" "$SEARCH_DB" "$query"
 }
 
 # --- dispatch --------------------------------------------------------------
 
 case "${1:-}" in
-  status) cmd_status ;;
-  list)   shift; cmd_list "$@" ;;
-  thumb)  shift; cmd_thumb "$@" ;;
-  meta)   shift; cmd_meta "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  list)   shift
+          lp=""
+          for a in "$@"; do case "$a" in /*) lp="$a"; break ;; esac; done
+          mtp_locked "$lp" cmd_list "$@" ;;
+  list-cached) shift; cmd_list_cached "$@" ;;
+  thumb)  shift
+          [ -s "${2:-}" ] && exit 0   # уже в кэше — телефон не нужен
+          mtp_locked "${1:-}" cmd_thumb "$@" ;;
+  meta)   shift; mtp_locked "${1:-}" cmd_meta "$@" ;;
   names)  shift; cmd_names "$@" ;;
-  copy)   shift; cmd_copy "$@" ;;
-  clip-image) shift; cmd_clip_image "$@" ;;
+  copy)   shift; mtp_locked "${1:-}" cmd_copy "$@" ;;
+  clip-image) shift; mtp_locked "${1:-}" cmd_clip_image "$@" ;;
   clip-text)  shift; cmd_clip_text "$@" ;;
   pick-dir)   shift; cmd_pick_dir "$@" ;;
   index)      shift; cmd_index "$@" ;;
@@ -308,8 +846,9 @@ case "${1:-}" in
   *)
     cat >&2 <<'USAGE'
 usage: oma-mediateka <command> [args]
-  status
-  list <dcim>
+  status [iphone|android] [--force]
+  list [--cache KEY] <dir>...
+  list-cached <KEY>
   thumb <src> <dst> <kind> [thumb|preview]
   meta <src>
   names <dir>

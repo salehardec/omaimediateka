@@ -1,4 +1,4 @@
-// MediaModel.js — чистая модель медиатеки iPhone.
+// MediaModel.js — чистая модель медиатеки телефона (iPhone и Android).
 //
 // Без Qt и без файловой системы: на входе — сырой TSV от `oma-mediateka list`
 // и параметры кэша, на выходе — готовые к показу элементы. Импортируется в QML
@@ -7,11 +7,15 @@
 var PHOTO_EXTS = {
   jpg: true, jpeg: true, png: true, heic: true, heif: true, webp: true, gif: true
 }
-var VIDEO_EXTS = { mp4: true, mov: true, m4v: true }
+var VIDEO_EXTS = { mp4: true, mov: true, m4v: true, "3gp": true, mkv: true, webm: true }
 
 var MONTHS_RU = [
   "января", "февраля", "марта", "апреля", "мая", "июня",
   "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+var MONTHS_RU_NOM = [
+  "январь", "февраль", "март", "апрель", "май", "июнь",
+  "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"
 ]
 
 // --- утилиты ---------------------------------------------------------------
@@ -74,7 +78,10 @@ function isSidecar(name) {
 // --- парсинг листинга ------------------------------------------------------
 
 // Строка: "<mtime>\t<size>\t<path>". Возвращает массив элементов.
-function parseListing(raw) {
+// deviceKey (тип и id телефона) входит в ключ кэша превью: у разных устройств
+// бывают файлы с одинаковыми путями и размерами (IMG_0001.jpg).
+function parseListing(raw, deviceKey) {
+  var dev = String(deviceKey || "")
   var out = []
   var lines = String(raw || "").split("\n")
   for (var i = 0; i < lines.length; i++) {
@@ -105,7 +112,7 @@ function parseListing(raw) {
       folder: folder,
       folderNum: folderKey(folder),
       num: numericKey(name),
-      key: hashKey(path + "|" + mtime + "|" + size)
+      key: hashKey((dev === "" ? "" : dev + "|") + path + "|" + mtime + "|" + size)
     })
   }
   return out
@@ -120,23 +127,48 @@ function compareChrono(a, b) {
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0
 }
 
-// order: "new" (по умолчанию) | "old".
-function sortItems(items, order) {
+// У Android нет нумерации папок и файлов как у Apple (IMG_0001 в 100APPLE):
+// имена вида PXL_20260101_120000123.jpg, поэтому порядок задаёт время файла.
+function compareByTime(a, b) {
+  if (a.mtime !== b.mtime) return a.mtime - b.mtime
+  return a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+}
+
+// order: "new" (по умолчанию) | "old". byTime — хронология по mtime (Android).
+function sortItems(items, order, byTime) {
   var copy = (items || []).slice()
-  copy.sort(compareChrono)
+  copy.sort(byTime ? compareByTime : compareChrono)
   if (order !== "old") copy.reverse()
   return copy
 }
 
 // --- фильтр ----------------------------------------------------------------
 
-function filterItems(items, query) {
-  var q = String(query || "").trim().toLowerCase()
+function pad2(n) { return (n < 10 ? "0" : "") + n }
+
+// Даты файла в нескольких видах, чтобы запрос находил и «2026-10-13», и
+// «13.10.2026», и «13 октября», и «октябрь 2026».
+function dateText(epochSec) {
+  var s = Number(epochSec) || 0
+  if (s <= 0) return ""
+  var d = new Date(s * 1000)
+  if (isNaN(d.getTime())) return ""
+  var y = d.getFullYear(), m = d.getMonth(), day = d.getDate()
+  return y + "-" + pad2(m + 1) + "-" + pad2(day) + " " +
+    pad2(day) + "." + pad2(m + 1) + "." + y + " " +
+    day + " " + MONTHS_RU[m] + " " + y + " " + MONTHS_RU_NOM[m] + " " + y
+}
+
+// withDates — искать и по дате файла (для Android, где поиска по содержимому нет).
+function filterItems(items, query, withDates) {
+  var q = String(query || "").trim().toLowerCase().replace(/ё/g, "е")
   if (q === "") return (items || []).slice()
   var words = q.split(/\s+/)
   var out = []
   for (var i = 0; i < (items || []).length; i++) {
     var hay = items[i].name.toLowerCase() + " " + items[i].folder.toLowerCase()
+    if (withDates) hay += " " + dateText(items[i].mtime)
+    hay = hay.replace(/ё/g, "е")
     var ok = true
     for (var w = 0; w < words.length; w++) {
       if (hay.indexOf(words[w]) === -1) { ok = false; break }
@@ -438,10 +470,33 @@ function countKind(items, kind) {
 
 // --- экспорт ---------------------------------------------------------------
 
-// Каталог экспорта по умолчанию.
-function defaultExportDir(home) {
+// Каталог экспорта по умолчанию (type — "iphone" | "android").
+function defaultExportDir(home, type) {
   var h = String(home || "").replace(/\/+$/, "")
-  return h + "/Pictures/iPhone"
+  return h + "/Pictures/" + (type === "android" ? "Android" : "iPhone")
+}
+
+// Название устройства для заголовков: «iPhone» / «Android».
+function deviceTypeLabel(type) {
+  return type === "android" ? "Android" : "iPhone"
+}
+
+// Подпись пилюли в баре: без устройства — «Omaimediateka», иначе тип и модель
+// («iPhone 15 Pro», «Android Pixel 8»); нет модели — просто «iPhone»/«Android».
+// Модель iPhone уже начинается с «iPhone», слово не повторяем.
+function pillLabel(type, model) {
+  if (type !== "iphone" && type !== "android") return "Omaimediateka"
+  var label = deviceTypeLabel(type)
+  var m = String(model || "").trim()
+  if (m === "") return label
+  if (m.toLowerCase().indexOf(label.toLowerCase()) === 0) return m
+  return label + " " + m
+}
+
+// Ключ устройства для кэшей: тип и id (UDID или host MTP).
+function deviceKey(device) {
+  if (!device || !device.type || device.type === "none" || !device.id) return ""
+  return device.type + "-" + device.id
 }
 
 // Безопасное базовое имя: без путей, без ведущих точек, без управляющих
@@ -513,6 +568,10 @@ if (typeof module !== "undefined" && module.exports) {
     parseListing: parseListing,
     sortItems: sortItems,
     filterItems: filterItems,
+    dateText: dateText,
+    deviceTypeLabel: deviceTypeLabel,
+    pillLabel: pillLabel,
+    deviceKey: deviceKey,
     parseQuery: parseQuery,
     stemRu: stemRu,
     normalizeText: normalizeText,

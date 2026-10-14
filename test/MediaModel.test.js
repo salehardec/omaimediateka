@@ -374,4 +374,103 @@ test("mergeSearch: сцена из MediaAnalysis не дублирует уже 
   assert.deepStrictEqual(res[0].matched.scene, ["Море", "Волна"])
 })
 
+// ---------------------------------------------------------------- Android --
+
+const ANDROID_ROOT = "/run/user/1000/gvfs/mtp:host=Pixel/Internal shared storage"
+function ts(y, m, d, h, mi) { return new Date(y, m - 1, d, h || 12, mi || 0).getTime() / 1000 }
+const ANDROID_LISTING = [
+  ts(2026, 10, 13, 9, 30) + "\t100\t" + ANDROID_ROOT + "/DCIM/Camera/PXL_20261013_093000123.jpg",
+  ts(2026, 10, 12, 18, 0) + "\t200\t" + ANDROID_ROOT + "/DCIM/Camera/PXL_20261012_180000000.mp4",
+  ts(2026, 3, 1, 8, 0) + "\t300\t" + ANDROID_ROOT + "/DCIM/Screenshots/Screenshot_20260301-080000.png",
+  ts(2025, 12, 31, 23, 59) + "\t400\t" + ANDROID_ROOT + "/Pictures/Telegram/photo_1.jpg",
+  ts(2026, 1, 5, 10, 0) + "\t500\t" + ANDROID_ROOT + "/DCIM/Camera/VID_20260105_100000.3gp",
+  ts(2026, 1, 6, 10, 0) + "\t600\t" + ANDROID_ROOT + "/DCIM/Camera/clip.webm",
+  ts(2026, 1, 7, 10, 0) + "\t700\t" + ANDROID_ROOT + "/DCIM/Camera/.trashed-1-IMG.jpg",
+  ts(2026, 1, 8, 10, 0) + "\t800\t" + ANDROID_ROOT + "/DCIM/Camera/notes.txt"
+].join("\n")
+
+test("parseListing: Android — 3gp/webm видео, скрытые и не-медиа отброшены", () => {
+  const items = M.parseListing(ANDROID_LISTING, "android-Pixel")
+  assert.strictEqual(items.length, 6)
+  assert.strictEqual(items.find((i) => i.name === "VID_20260105_100000.3gp").kind, "video")
+  assert.strictEqual(items.find((i) => i.name === "clip.webm").kind, "video")
+  assert.strictEqual(items.some((i) => i.name.startsWith(".")), false)
+})
+
+test("parseListing: ключ кэша различает устройства с одинаковыми путями", () => {
+  const line = "1600000000\t100\t/mnt/DCIM/Camera/IMG_0001.jpg"
+  const a = M.parseListing(line, "android-A")[0]
+  const b = M.parseListing(line, "android-B")[0]
+  const plain = M.parseListing(line)[0]
+  assert.notStrictEqual(a.key, b.key)
+  assert.notStrictEqual(a.key, plain.key)
+  assert.notStrictEqual(M.thumbPath("/c", a, "thumb"), M.thumbPath("/c", b, "thumb"))
+  // без ключа устройства ключ прежний (кэш iPhone не сбрасывается)
+  assert.strictEqual(plain.key, M.hashKey("/mnt/DCIM/Camera/IMG_0001.jpg|1600000000|100"))
+})
+
+test("sortItems: Android — хронология по mtime, не по числу в имени", () => {
+  const items = M.sortItems(M.parseListing(ANDROID_LISTING, "android-Pixel"), "new", true)
+  assert.deepStrictEqual(items.map((i) => i.name), [
+    "PXL_20261013_093000123.jpg", "PXL_20261012_180000000.mp4",
+    "Screenshot_20260301-080000.png", "clip.webm",
+    "VID_20260105_100000.3gp", "photo_1.jpg"
+  ])
+  for (let i = 1; i < items.length; i++) assert.strictEqual(items[i - 1].mtime >= items[i].mtime, true)
+  const old = M.sortItems(items, "old", true)
+  assert.strictEqual(old[0].name, "photo_1.jpg")
+})
+
+test("filterItems: даты находят файлы только при withDates", () => {
+  const items = M.parseListing(ANDROID_LISTING, "android-Pixel")
+  const names = (q, dates) => M.filterItems(items, q, dates).map((i) => i.name).sort()
+  assert.deepStrictEqual(names("2026-10-13", true), ["PXL_20261013_093000123.jpg"])
+  assert.deepStrictEqual(names("13.10.2026", true), ["PXL_20261013_093000123.jpg"])
+  assert.deepStrictEqual(names("13 октября", true), ["PXL_20261013_093000123.jpg"])
+  assert.deepStrictEqual(names("октябрь 2026", true),
+    ["PXL_20261012_180000000.mp4", "PXL_20261013_093000123.jpg"])
+  assert.deepStrictEqual(names("декабр 2025", true), ["photo_1.jpg"])
+  // имя и дата вместе: слова И
+  assert.deepStrictEqual(names("pxl 12.10.2026", true), ["PXL_20261012_180000000.mp4"])
+  // без withDates (iPhone) дата в запросе ничего не находит
+  assert.deepStrictEqual(names("13.10.2026", false), [])
+  assert.deepStrictEqual(names("pxl", false).length, 2)
+})
+
+test("dateText: форматы даты", () => {
+  const t = M.dateText(ts(2026, 3, 1, 8, 0))
+  assert.strictEqual(t.indexOf("2026-03-01") !== -1, true)
+  assert.strictEqual(t.indexOf("01.03.2026") !== -1, true)
+  assert.strictEqual(t.indexOf("1 марта 2026") !== -1, true)
+  assert.strictEqual(t.indexOf("март 2026") !== -1, true)
+  assert.strictEqual(M.dateText(0), "")
+})
+
+test("defaultExportDir/deviceTypeLabel/deviceKey по типу устройства", () => {
+  assert.strictEqual(M.defaultExportDir("/home/u"), "/home/u/Pictures/iPhone")
+  assert.strictEqual(M.defaultExportDir("/home/u", "iphone"), "/home/u/Pictures/iPhone")
+  assert.strictEqual(M.defaultExportDir("/home/u/", "android"), "/home/u/Pictures/Android")
+  assert.strictEqual(M.deviceTypeLabel("android"), "Android")
+  assert.strictEqual(M.deviceTypeLabel("iphone"), "iPhone")
+  assert.strictEqual(M.deviceKey({ type: "android", id: "Pixel_7" }), "android-Pixel_7")
+  assert.strictEqual(M.deviceKey({ type: "none", id: "" }), "")
+  assert.strictEqual(M.deviceKey(null), "")
+})
+
+test("pillLabel: нет устройства / iPhone с моделью / Android с моделью", () => {
+  assert.strictEqual(M.pillLabel("none", ""), "Omaimediateka")
+  assert.strictEqual(M.pillLabel("", "iPhone 15 Pro"), "Omaimediateka")
+  assert.strictEqual(M.pillLabel("iphone", "iPhone 15 Pro"), "iPhone 15 Pro")
+  assert.strictEqual(M.pillLabel("android", "Pixel 8"), "Android Pixel 8")
+})
+
+test("pillLabel: модель не определилась — просто тип; без дублей слова", () => {
+  assert.strictEqual(M.pillLabel("iphone", ""), "iPhone")
+  assert.strictEqual(M.pillLabel("android", ""), "Android")
+  assert.strictEqual(M.pillLabel("android", "  "), "Android")
+  assert.strictEqual(M.pillLabel("iphone", "iPhone16,1"), "iPhone16,1")
+  assert.strictEqual(M.pillLabel("iphone", "SE"), "iPhone SE")
+  assert.strictEqual(M.pillLabel("android", "Android One"), "Android One")
+})
+
 console.log("\n" + passed + " passed")
