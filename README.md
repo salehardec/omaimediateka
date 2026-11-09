@@ -24,19 +24,22 @@ disappears automatically when it is unplugged.
 - **iPhone and Android** side by side: the popup shows the device type and name; if
   both are plugged in, a switcher in the popup picks which one to browse (the
   ready device is shown first, the iPhone wins a tie).
-- **Preview grid** over every `DCIM` subfolder (`100APPLE`, `101APPLE`, …).
+- **Preview grid** over every `DCIM` subfolder (`100APPLE`, `101APPLE`, …). A Live
+  Photo is one cell: its HEIC still is shown, and the paired MOV plays from it.
 - **Lazy thumbnails** — generated on demand for visible cells, one decode at a time,
   cached on disk and invalidated by size/mtime.
 - **Fullscreen viewer** — photos fit the screen; videos play inline through
   QtMultimedia. `←/→` navigates, metadata (name, date, size, duration) is shown.
+  For a Live Photo the play button (or `p`/`Space`) plays its MOV component.
 - **Live filter** by file name or folder, plus **content search** over Apple's
   on-device index (localized scene/OCR tokens, scene and action labels from
   `MediaAnalysis`, and English captions, including per-segment video captions)
   with a per-cell source badge, and newest-/oldest-first sorting.
 - **Export** (read-only on the phone): save the original to `~/Pictures/iPhone`
   (`Ctrl+S`) or pick a folder (`Ctrl+Shift+S`); existing names get a ` (1)`, ` (2)`
-  suffix instead of being overwritten. `Ctrl+C` puts a photo in the clipboard as
-  `image/png` (HEIC is decoded with `heif-convert`), or a video's path as text.
+  suffix instead of being overwritten. A Live Photo is saved as both its HEIC and
+  MOV files. `Ctrl+C` puts a photo in the clipboard as `image/png` (HEIC is decoded
+  with `heif-convert`), or a video's path as text.
 - **Batch selection**: `Space`, the checkbox, or `Ctrl`+click selects cells,
   `Ctrl+A` selects all visible; the export buttons then act on the whole selection.
 - **Clear states** instead of a blank screen: phone not connected, not trusted,
@@ -210,8 +213,9 @@ Uninstall with `./install.sh --uninstall`.
   The index is refreshed incrementally when the phone is reconnected (or on
   demand), so browsing never waits for it. Russian tokens are stemmed and matched
   by prefix, English captions by word prefix, and name/folder matches are merged
-  in. Search results collapse a Live Photo's HEIC+MOV into the photo and rank
-  elements by how many content sources matched; low-confidence labels are dropped.
+  in. A Live Photo's HEIC+MOV pair is collapsed into the photo in the grid and in
+  search results, which rank elements by how many content sources matched;
+  low-confidence labels are dropped.
 - **Sorting** — iPhone: by Apple’s file numbering (folder + number), which is
   chronological even when gvfs `mtime` is unreliable, with mtime as a tie-breaker.
   Android: by file modification time (`mtime`), as Android names carry no sequence.
@@ -236,8 +240,9 @@ Design notes (in Russian): [`docs/superpowers/specs/2026-10-01-iphone-media-plug
   motion-photo extras are not shown separately; the phone must stay unlocked and in
   File transfer mode. Detecting “charging only” relies on the USB vendor id of common
   Android makers, so an unusual make is reported as “not connected” instead.
-- **Live Photos** show up as two separate items in the grid (a HEIC and a MOV);
-  in content-search results the pair is collapsed to the photo.
+- **Live Photos** are stored by iOS as a HEIC + MOV pair. The grid shows one cell
+  (the still, with a ▶ marker); the MOV is played from the viewer and exported
+  together with the still. Android never pairs files this way.
 - **Content search** reuses an undocumented Apple index: ~99.5 % of assets are
   covered, assets stored only in iCloud are skipped (no local file), and an iOS
   update may change the schema — in which case search degrades gracefully to

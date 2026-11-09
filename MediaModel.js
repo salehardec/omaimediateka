@@ -376,6 +376,97 @@ function dedupeLivePairs(items) {
   return out
 }
 
+// --- Live Photo в сетке ----------------------------------------------------
+//
+// Пара Live Photo — фото и MOV с одним базовым именем в одной папке. В списке
+// файлов остаются оба, но в сетке нужна одна ячейка: фото, а MOV — «под» ним
+// (livePath). Ключ включает папку, чтобы одноимённые файлы из разных папок
+// (Android) не склеивались.
+
+function liveKey(item) {
+  return String(item.folder || "").toLowerCase() + "/" + baseNameOf(item.name).toLowerCase()
+}
+
+// Ключ -> { photo, video } только для однозначных пар (ровно одно фото и одно
+// видео с этим ключом). Остальные файлы в карту не попадают.
+function livePairMap(items) {
+  var groups = {}
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    if (!it || (it.kind !== "photo" && it.kind !== "video")) continue
+    var k = liveKey(it)
+    var g = groups[k]
+    if (!g) { g = { photos: [], videos: [] }; groups[k] = g }
+    if (it.kind === "photo") g.photos.push(it)
+    else g.videos.push(it)
+  }
+  var map = {}
+  for (var key in groups) {
+    var gg = groups[key]
+    if (gg.photos.length === 1 && gg.videos.length === 1)
+      map[key] = { photo: gg.photos[0], video: gg.videos[0] }
+  }
+  return map
+}
+
+function withLive(photo, video) {
+  var c = cloneItem(photo)
+  c.livePath = video.path
+  c.liveName = video.name
+  c.liveSize = video.size
+  c.liveMtime = video.mtime
+  return c
+}
+
+// display-список: парные MOV убраны, фото получили livePath. allItems — полный
+// список файлов: нужен, когда items — уже отфильтрованная выдача поиска, где
+// MOV мог не совпасть. Видео без фото в items остаётся самостоятельным
+// элементом, чтобы поиск по caption не терял ассет.
+function collapseLivePairs(items, allItems) {
+  var map = livePairMap(allItems || items)
+  var photoKeys = {}
+  for (var j = 0; j < (items || []).length; j++)
+    if (items[j].kind === "photo") photoKeys[liveKey(items[j])] = true
+  var out = []
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    var pair = map[liveKey(it)]
+    if (pair && it.kind === "video") {
+      if (photoKeys[liveKey(it)] === true) continue
+      out.push(it)
+      continue
+    }
+    if (pair && it.kind === "photo") out.push(withLive(it, pair.video))
+    else out.push(it)
+  }
+  return out
+}
+
+// Файлы для сохранения: Live-фото отдаёт и HEIC, и MOV (как экспорт в Photos),
+// остальные — сами себя. Порядок исходный, MOV идёт сразу за фото.
+function expandLive(items) {
+  var out = []
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    out.push(it)
+    if (!it.livePath) continue
+    var name = it.liveName || basename(it.livePath)
+    out.push({
+      path: it.livePath,
+      name: name,
+      ext: extOf(name),
+      kind: "video",
+      mtime: it.liveMtime || 0,
+      size: it.liveSize || 0,
+      folder: it.folder,
+      folderNum: it.folderNum,
+      num: it.num,
+      key: hashKey("live|" + it.livePath + "|" + (it.liveMtime || 0) + "|" + (it.liveSize || 0))
+    })
+  }
+  return out
+}
+
 // Объединяет совпадения по имени/папке с результатами индекса, дедуплицирует
 // и ранжирует. items — исходный список (в хронологическом порядке).
 function mergeSearch(items, rows, query) {
@@ -580,6 +671,10 @@ if (typeof module !== "undefined" && module.exports) {
     groupSearchRows: groupSearchRows,
     mergeSearch: mergeSearch,
     dedupeLivePairs: dedupeLivePairs,
+    liveKey: liveKey,
+    livePairMap: livePairMap,
+    collapseLivePairs: collapseLivePairs,
+    expandLive: expandLive,
     searchScore: searchScore,
     contentSources: contentSources,
     badgeLabel: badgeLabel,

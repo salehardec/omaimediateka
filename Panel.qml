@@ -269,9 +269,12 @@ Panel {
 
   function recompute() {
     var useIndex = root.isIphone && root.indexReady && root.rowsQuery === root.query && Model.parseQuery(root.query).valid
-    root.shown = useIndex
+    var list = useIndex
       ? Model.mergeSearch(root.items, root.searchRows, root.query)
       : Model.filterItems(root.items, root.query, root.isAndroid)
+    // Live Photo — одна ячейка фото, MOV остаётся «под» ней (livePath).
+    // У Android пары не склеиваем: одноимённые файлы там бывают не связаны.
+    root.shown = root.isIphone ? Model.collapseLivePairs(list, root.items) : list
     if (root.cursor >= root.shown.length) root.cursor = Math.max(0, root.shown.length - 1)
     if (root.viewerIndex >= root.shown.length) root.viewerIndex = root.shown.length - 1
   }
@@ -494,7 +497,7 @@ Panel {
     root.previewWantedKey = it.key
     if (root.previewState[it.key] === true) {
       root.previewReady = true
-      if (it.kind === "video") root.loadMeta(it)
+      if (it.kind === "video" || it.livePath) root.loadMeta(it)
       return
     }
     if (!previewProc.running) root.startPreview(it)
@@ -531,7 +534,7 @@ Panel {
       if (wanted === key && root.viewerIndex >= 0 && cur && cur.key === key) {
         if (exitCode === 0) {
           root.previewReady = true
-          if (cur.kind === "video") root.loadMeta(cur)
+          if (cur.kind === "video" || cur.livePath) root.loadMeta(cur)
         } else {
           root.previewFailed = true
         }
@@ -541,10 +544,10 @@ Panel {
 
   // ---------- метаданные видео ----------
   function loadMeta(item) {
-    if (!item || item.kind !== "video") return
+    if (!item || (item.kind !== "video" && !item.livePath)) return
     if (metaProc.running) { root.metaPending = true; return }
     root.metaKey = item.key
-    metaProc.command = [root.helper, "meta", item.path]
+    metaProc.command = [root.helper, "meta", item.livePath || item.path]
     metaProc.running = true
   }
   property bool metaPending: false
@@ -574,7 +577,7 @@ Panel {
 
   function toggleVideo() {
     var it = root.currentItem()
-    if (!it || it.kind !== "video") return
+    if (!it || (it.kind !== "video" && !it.livePath)) return
     root.videoActive = !root.videoActive
   }
 
@@ -685,13 +688,15 @@ Panel {
   }
 
   // Сохранить оригиналы без перекодирования. askDir=true — диалог выбора папки.
+  // Live Photo сохраняется парой: HEIC + MOV (как экспорт «живого» снимка).
   function saveItems(items, askDir) {
-    if (!items || items.length === 0) { root.showNotice("Нечего сохранять"); return }
+    var files = Model.expandLive(items || [])
+    if (files.length === 0) { root.showNotice("Нечего сохранять"); return }
     if (askDir) {
-      root.enqueueJob("pick-dir", [root.home + "/Pictures"], { items: items })
+      root.enqueueJob("pick-dir", [root.home + "/Pictures"], { items: files })
     } else {
       var dir = Model.defaultExportDir(root.home, root.deviceType)
-      root.enqueueJob("names", [dir], { items: items, dir: dir })
+      root.enqueueJob("names", [dir], { items: files, dir: dir })
     }
   }
 
@@ -1281,7 +1286,7 @@ Panel {
             if (!item) return
             var cur = root.currentItem()
             if (cur) {
-              item.source = root.fileUrl(cur.path)
+              item.source = root.fileUrl(cur.livePath || cur.path)
               item.autoPlay = true
               item.play()
             }
@@ -1351,8 +1356,13 @@ Panel {
               var parts = [it.name]
               if (it.mtime > 0) parts.push(Model.formatDate(it.mtime) + " " + Model.formatTime(it.mtime))
               parts.push(Model.formatSize(it.size))
-              if (it.kind === "video" && root.videoMeta && root.videoMeta.duration > 0)
+              if (it.livePath) {
+                parts.push("Live")
+                if (root.videoMeta && root.videoMeta.duration > 0)
+                  parts.push(Model.formatDuration(root.videoMeta.duration))
+              } else if (it.kind === "video" && root.videoMeta && root.videoMeta.duration > 0) {
                 parts.push(Model.formatDuration(root.videoMeta.duration))
+              }
               if (Model.badgeLabel(it) !== "") parts.push(Model.badgeLabel(it))
               var terms = Model.matchedTerms(it, 4)
               if (terms.length > 0) parts.push("метки: " + terms.join(", "))
@@ -1373,7 +1383,7 @@ Panel {
           Button {
             visible: {
               var it = root.currentItem()
-              return !!it && it.kind === "video"
+              return !!it && (it.kind === "video" || !!it.livePath)
             }
             text: root.videoActive ? "Пауза" : "Играть"
             foreground: root.fg
@@ -1468,6 +1478,7 @@ Panel {
     required property int index
 
     readonly property bool isVideo: !!modelData && modelData.kind === "video"
+    readonly property bool hasLive: !!modelData && !!modelData.livePath
     readonly property bool selected: !!modelData && root.selection[modelData.key] === true
 
     width: grid.cellWidth
@@ -1503,12 +1514,12 @@ Panel {
         font.pixelSize: Style.font.display
       }
 
-      // видеомаркер
+      // маркер видео: у Live Photo под фото лежит MOV — играем его по клику
       Rectangle {
         anchors.left: parent.left
         anchors.bottom: parent.bottom
         anchors.margins: Style.space(4)
-        visible: cell.isVideo
+        visible: cell.isVideo || cell.hasLive
         width: playIcon.implicitWidth + Style.space(8)
         height: playIcon.implicitHeight + Style.space(3)
         radius: Style.space(4)
