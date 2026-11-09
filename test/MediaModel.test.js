@@ -374,6 +374,90 @@ test("mergeSearch: сцена из MediaAnalysis не дублирует уже 
   assert.deepStrictEqual(res[0].matched.scene, ["Море", "Волна"])
 })
 
+// ------------------------------------------------- Live Photo в сетке ------
+
+const LIVE_LISTING = [
+  "1600000000\t100\t/mnt/DCIM/100APPLE/IMG_0001.HEIC",
+  "1600000100\t101\t/mnt/DCIM/100APPLE/IMG_0001.MOV",
+  "1600000200\t102\t/mnt/DCIM/100APPLE/IMG_0002.JPG",
+  "1600000300\t103\t/mnt/DCIM/101APPLE/IMG_0003.MOV",
+  "1600000400\t104\t/mnt/DCIM/101APPLE/IMG_0003.JPG",
+  "1600000500\t105\t/mnt/DCIM/100APPLE/IMG_0004.MOV",
+  "1600000600\t106\t/mnt/DCIM/100APPLE/IMG_0004.MOV",
+  "1600000700\t107\t/mnt/DCIM/100APPLE/IMG_0005.HEIC",
+  "1600000800\t108\t/mnt/DCIM/100APPLE/IMG_0005.HEIC",
+  "1600000900\t109\t/mnt/DCIM/100APPLE/IMG_0006.HEIC",
+  "1600001000\t110\t/mnt/DCIM/101APPLE/IMG_0006.MOV"
+].join("\n")
+
+test("collapseLivePairs: пара HEIC+MOV — одна ячейка с livePath", () => {
+  const items = M.parseListing(LIVE_LISTING)
+  const res = M.collapseLivePairs(items)
+  assert.deepStrictEqual(res.map((i) => i.name), [
+    "IMG_0001.HEIC", "IMG_0002.JPG", "IMG_0003.JPG",
+    "IMG_0004.MOV", "IMG_0004.MOV", "IMG_0005.HEIC", "IMG_0005.HEIC",
+    "IMG_0006.HEIC", "IMG_0006.MOV"
+  ])
+  const live = res.find((i) => i.name === "IMG_0001.HEIC")
+  assert.strictEqual(live.kind, "photo")
+  assert.strictEqual(live.livePath, "/mnt/DCIM/100APPLE/IMG_0001.MOV")
+  assert.strictEqual(live.liveName, "IMG_0001.MOV")
+  assert.strictEqual(live.liveSize, 101)
+  assert.strictEqual(M.badgeLabel(live), "")
+  // исходный список не изменён
+  assert.strictEqual(items.length, 11)
+  assert.strictEqual(items.some((i) => i.name === "IMG_0001.MOV"), true)
+})
+
+test("collapseLivePairs: одноимённые в разных папках и одинаковый тип не пара", () => {
+  const res = M.collapseLivePairs(M.parseListing(LIVE_LISTING))
+  // IMG_0006.HEIC в 100APPLE и IMG_0006.MOV в 101APPLE — не Live Photo
+  assert.strictEqual(res.some((i) => i.name === "IMG_0006.MOV"), true)
+  // два одинаковых фото и два одинаковых видео остаются как есть
+  assert.strictEqual(res.filter((i) => i.name === "IMG_0005.HEIC").length, 2)
+  assert.strictEqual(res.filter((i) => i.name === "IMG_0004.MOV").length, 2)
+})
+
+test("collapseLivePairs: поиск отдал только MOV — видео не теряется", () => {
+  const items = M.parseListing(LIVE_LISTING)
+  const onlyVideo = items.filter((i) => i.name === "IMG_0001.MOV")
+  const res = M.collapseLivePairs(onlyVideo, items)
+  assert.strictEqual(res.length, 1)
+  assert.strictEqual(res[0].name, "IMG_0001.MOV")
+  assert.strictEqual(res[0].kind, "video")
+})
+
+test("collapseLivePairs: фото из выдачи поиска получает MOV из полного списка", () => {
+  const items = M.parseListing(LIVE_LISTING)
+  const photoFromSearch = Object.assign({}, items.find((i) => i.name === "IMG_0001.HEIC"))
+  photoFromSearch.sources = ["scene"]
+  const res = M.collapseLivePairs([photoFromSearch], items)
+  assert.strictEqual(res.length, 1)
+  assert.strictEqual(res[0].name, "IMG_0001.HEIC")
+  assert.strictEqual(res[0].livePath, "/mnt/DCIM/100APPLE/IMG_0001.MOV")
+  assert.deepStrictEqual(res[0].sources, ["scene"])
+})
+
+test("collapseLivePairs: повторный вызов идемпотентен", () => {
+  const once = M.collapseLivePairs(M.parseListing(LIVE_LISTING))
+  const twice = M.collapseLivePairs(once)
+  assert.deepStrictEqual(twice.map((i) => i.name), once.map((i) => i.name))
+  assert.strictEqual(twice.find((i) => i.name === "IMG_0001.HEIC").livePath,
+    "/mnt/DCIM/100APPLE/IMG_0001.MOV")
+})
+
+test("expandLive: для Live-фото к сохранению идут HEIC и MOV", () => {
+  const live = M.collapseLivePairs(M.parseListing(LIVE_LISTING))
+    .find((i) => i.name === "IMG_0001.HEIC")
+  const files = M.expandLive([live])
+  assert.deepStrictEqual(files.map((f) => f.name), ["IMG_0001.HEIC", "IMG_0001.MOV"])
+  assert.deepStrictEqual(files.map((f) => f.kind), ["photo", "video"])
+  assert.strictEqual(files[1].path, "/mnt/DCIM/100APPLE/IMG_0001.MOV")
+  // обычное фото и видео — как есть, без размножения
+  const plain = M.parseListing(LIVE_LISTING).filter((i) => i.name === "IMG_0002.JPG")
+  assert.deepStrictEqual(M.expandLive(plain).map((f) => f.name), ["IMG_0002.JPG"])
+})
+
 // ---------------------------------------------------------------- Android --
 
 const ANDROID_ROOT = "/run/user/1000/gvfs/mtp:host=Pixel/Internal shared storage"
